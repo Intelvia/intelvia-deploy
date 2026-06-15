@@ -1,0 +1,5 @@
+.env
+backend/parquet_cache/
+*.log
+*.zip
+*.DS_Store

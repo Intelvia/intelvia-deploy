@@ -1,0 +1,36 @@
+services:
+  backend:
+    image: docker.io/intelvia/intelvia-backend:v1.0.0-beta.5
+    env_file:
+      - .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    volumes:
+      - ./backend/parquet_cache:/app/parquet_cache:z
+
+  mariadb:
+    image: docker.io/mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${MARIADB_DATABASE}
+      MARIADB_USER: ${MARIADB_USER}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD}
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - ./mariadb/conf.d:/etc/mysql/conf.d:z
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -uroot --password=\"$${MARIADB_ROOT_PASSWORD}\" -e 'SELECT 1' >/dev/null 2>&1"]
+      start_period: 3s
+      interval: 10s
+      timeout: 5s
+
+  frontend:
+    image: docker.io/intelvia/intelvia-frontend:v1.0.0-beta.5
+    ports:
+      - "8080:8080"
+    depends_on:
+      - backend
+
+volumes:
+  mariadb_data:
