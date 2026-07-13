@@ -6,8 +6,40 @@ services:
     depends_on:
       mariadb:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - ./backend/parquet_cache:/app/parquet_cache:z
+
+  celery-worker:
+    image: docker.io/intelvia/intelvia-backend:v1.0.0-beta.4
+    env_file:
+      - .env
+    entrypoint: []
+    command: >
+      poetry run celery -A api worker
+      --loglevel=${CELERY_WORKER_LOG_LEVEL:-info}
+      --concurrency=${CELERY_WORKER_CONCURRENCY:-1}
+      --prefetch-multiplier=${CELERY_WORKER_PREFETCH_MULTIPLIER:-1}
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend/parquet_cache:/app/parquet_cache:z
+
+  celery-beat:
+    image: docker.io/intelvia/intelvia-backend:v1.0.0-beta.4
+    env_file:
+      - .env
+    entrypoint: []
+    command: poetry run celery -A api beat --loglevel=${CELERY_BEAT_LOG_LEVEL:-info}
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   mariadb:
     image: docker.io/mariadb:11
@@ -25,6 +57,16 @@ services:
       interval: 10s
       timeout: 5s
 
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   frontend:
     image: docker.io/intelvia/intelvia-frontend:v1.0.0-beta.5
     ports:
@@ -34,3 +76,4 @@ services:
 
 volumes:
   mariadb_data:
+  redis_data:
