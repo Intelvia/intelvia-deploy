@@ -1,65 +1,87 @@
 # Intelvia Deployment
 
-This repository contains the deployment artifacts for running Intelvia from published container images. It is generated from the private Intelvia source repository; direct edits here may be overwritten by the next sync.
+This is a generated, deploy-only repository for published, immutable Intelvia images. Do not maintain or directly edit generated files here: changes may be overwritten by the next synchronization from `Intelvia/intelvia`, which is the sole source of truth.
 
-## Contents
+Only the checked-in Compose files, nginx templates, deploy/rollback scripts, environment examples, MariaDB configuration, and this documentation are generated. VM-local `.env` files, Docker credentials, `.deploy-state/`, `backups/`, and all parquet data are deliberately untracked and are never synchronized back to GitHub.
 
-- `docker-compose.yml`: production container stack
-- `.env.example`: required environment variables
-- `server-nginx.conf`: example VM-level TLS reverse proxy
-- `mariadb/conf.d/`: MariaDB runtime configuration
+## Hospital releases
 
-Application source code is intentionally not included.
-
-## Registry Access
-
-If the Intelvia images are private, authenticate to the registry before starting the stack:
-
-```bash
-docker login docker.io
-```
-
-The deploying institution needs pull access to these images:
-
-- `docker.io/intelvia/intelvia-backend`
-- `docker.io/intelvia/intelvia-frontend`
-
-## Configure
-
-Create a local `.env` file from the example:
+Hospital deployments use `docker-compose.yml`. `.env.example` is updated only when an operator-approved semantic release such as `v1.2.3` or `v1.2.3-beta.1` is published.
 
 ```bash
 cp .env.example .env
-```
-
-Set production values for Django, MariaDB, CAS, monitoring, and any institution-specific integration settings. Do not commit `.env`.
-
-Update `server-nginx.conf` with the deployment hostname and TLS certificate paths, or adapt it to the institution's existing nginx configuration.
-
-## Start
-
-```bash
-docker compose up -d
-```
-
-The backend container applies Django migrations and installs SQL-managed derived tables on startup.
-
-After initial data load or any source-data refresh, rebuild the derived tables and parquet cache:
-
-```bash
-docker compose run --rm backend poetry run python manage.py refresh_derived_tables
-docker compose run --rm backend poetry run python manage.py generate_parquets
-docker compose restart backend frontend
-```
-
-## Upgrade
-
-Pull the latest deployment repository changes, then pull and restart containers:
-
-```bash
-git pull
+# Configure the institution hostname, CAS, MariaDB, Sentry, and integration values.
+docker login docker.io
 docker compose pull
 docker compose up -d
 ```
 
-Run the derived-data refresh commands above when the release notes or deployment operator indicate that source data or derived artifacts need to be rebuilt.
+`INTELVIA_IMAGE_TAG` must remain an explicit semantic version. Intelvia does not publish or support `latest`, `edge`, or other mutable deployment tags.
+
+MariaDB uses the `intelvia_mariadb_data` volume because the Compose project name is fixed to `intelvia`. The parquet cache remains a separate `./backend/parquet_cache` bind mount.
+
+After a source-data refresh, explicitly rebuild derived data and parquets:
+
+```bash
+docker compose run --rm backend poetry run python manage.py migrate_derived_tables
+docker compose run --rm backend poetry run python manage.py refresh_derived_tables
+docker compose run --rm backend poetry run python manage.py generate_parquets
+docker compose run --rm backend poetry run python manage.py validate_parquets \
+  --image-tag "$INTELVIA_IMAGE_TAG" --source-commit operator-managed --write-manifest
+docker compose restart backend frontend
+```
+
+Before upgrading, read the release notes for migration or data-refresh requirements. Never run `docker compose down -v`, `docker volume prune`, or another volume-deleting command against a production deployment.
+
+## intelvia.app continuous deployment
+
+Intelvia's own VM uses `docker-compose.intelvia-app.yml`, `deploy.sh`, and host nginx. Every validated `main` commit publishes and deploys matching frontend/backend images named `sha-<full-commit>`.
+
+One-time VM prerequisites:
+
+- A non-root deploy user with Docker access and narrowly scoped passwordless sudo for `nginx -t`, nginx reload, and the Intelvia nginx files.
+- Docker Engine, Docker Compose, nginx, Certbot, `curl`, `flock`, and Git.
+- DNS for `intelvia.app`, ports 80/443, and a valid certificate under `/etc/letsencrypt/live/intelvia.app/`.
+- A clone of this deploy repository, normally `/home/deploy/intelvia-deploy`.
+- A production `.env` based on `.env.intelvia-app.example`.
+- Pull-only Docker Hub credentials stored in the GitHub production environment.
+- Existing parquets copied into `/srv/intelvia/parquets/sets/bootstrap`, or permission for the first deployment to run forced data preparation.
+
+The deploy workflow requires these GitHub environment secrets:
+
+- `PRODUCTION_DEPLOY_HOST`, `PRODUCTION_DEPLOY_PORT`, `PRODUCTION_DEPLOY_USER`
+- `PRODUCTION_DEPLOY_SSH_KEY`, `PRODUCTION_DEPLOY_KNOWN_HOSTS`
+- `PRODUCTION_APP_DIR`
+- `PRODUCTION_DOCKERHUB_USERNAME`, `PRODUCTION_DOCKERHUB_TOKEN`
+
+Pin `PRODUCTION_DEPLOY_KNOWN_HOSTS` out of band and keep `StrictHostKeyChecking=yes`. The VM credential needs pull access only; GitHub's existing Docker Hub credentials retain publish access.
+
+## Blue-green and parquet behavior
+
+The deployment script keeps one MariaDB service and switches between blue/green frontend/backend pairs on ports 8080 and 8081. Nginx reads `/etc/nginx/snippets/intelvia-active-upstream.conf` and is changed only after the inactive pair serves the requested immutable frontend bundle and passes frontend and database/parquet-aware backend health checks.
+
+Data-impacting commits are detected with `detect-data-impact.sh` and `data-impact-paths.txt`. The supported modes are:
+
+- `auto`: rebuild only for detected data-contract changes; required for automatic main deployments.
+- `force`: always refresh derived tables and stage a new parquet set.
+- `reuse`: explicitly reuse the current set; manual operator override only.
+
+New files are generated under `/srv/intelvia/parquets/.staging/<image-tag>-<timestamp>`, validated, and promoted to the matching path under `/srv/intelvia/parquets/sets/` only during a healthy cutover. The timestamp preserves rollback identity when an operator force-regenerates data for the same image. Each set includes `manifest.json` with its producer, checksums, sizes, row counts, and Arrow schemas.
+
+Deployment state and rollback records live under `.deploy-state/`. List recorded IDs with:
+
+```bash
+ls -1 .deploy-state/history
+```
+
+Restore a recorded application/parquet pair with:
+
+```bash
+bash rollback.sh <deployment-id>
+```
+
+Rollback does not reverse Django migrations. Production migrations must remain compatible with the previous application for at least one deployment window.
+
+Unused images older than seven days are pruned after a successful deployment. A rollback whose local image was pruned pulls the recorded immutable tag again from Docker Hub.
+
+Data-preparing releases retain pre-deployment database backups as daily, weekly, and monthly snapshots under `backups/`. Ordinary application-only releases skip this expensive dump along with derived refresh and parquet generation. These local snapshots do not replace encrypted off-VM backups and periodic restore testing.

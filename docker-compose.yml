@@ -1,10 +1,14 @@
-name: intelvia
+name: ${COMPOSE_PROJECT_NAME:-intelvia}
 
 services:
   backend:
-    image: docker.io/intelvia/intelvia-backend:v1.0.0-beta.5
+    image: docker.io/intelvia/intelvia-backend:${INTELVIA_IMAGE_TAG:?INTELVIA_IMAGE_TAG is required}
+    restart: unless-stopped
     env_file:
       - .env
+    environment:
+      PARQUET_CACHE_DIR: /app/parquet_cache
+      RUN_STARTUP_MIGRATIONS: "true"
     depends_on:
       mariadb:
         condition: service_healthy
@@ -14,7 +18,7 @@ services:
       - ./backend/parquet_cache:/app/parquet_cache:z
 
   celery-worker:
-    image: docker.io/intelvia/intelvia-backend:v1.0.0-beta.4
+    image: docker.io/intelvia/intelvia-backend:${INTELVIA_IMAGE_TAG:?INTELVIA_IMAGE_TAG is required}
     env_file:
       - .env
     entrypoint: []
@@ -32,7 +36,7 @@ services:
       - ./backend/parquet_cache:/app/parquet_cache:z
 
   celery-beat:
-    image: docker.io/intelvia/intelvia-backend:v1.0.0-beta.4
+    image: docker.io/intelvia/intelvia-backend:${INTELVIA_IMAGE_TAG:?INTELVIA_IMAGE_TAG is required}
     env_file:
       - .env
     entrypoint: []
@@ -45,6 +49,7 @@ services:
 
   mariadb:
     image: docker.io/mariadb:11
+    restart: unless-stopped
     environment:
       MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
       MARIADB_DATABASE: ${MARIADB_DATABASE}
@@ -52,12 +57,13 @@ services:
       MARIADB_PASSWORD: ${MARIADB_PASSWORD}
     volumes:
       - mariadb_data:/var/lib/mysql
-      - ./mariadb/conf.d:/etc/mysql/conf.d:z
+      - ./mariadb/conf.d:/etc/mysql/conf.d:ro,z
     healthcheck:
       test: ["CMD-SHELL", "mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -uroot --password=\"$${MARIADB_ROOT_PASSWORD}\" -e 'SELECT 1' >/dev/null 2>&1"]
       start_period: 3s
       interval: 10s
       timeout: 5s
+      retries: 12
 
   redis:
     image: redis:7-alpine
@@ -70,7 +76,10 @@ services:
       retries: 5
 
   frontend:
-    image: docker.io/intelvia/intelvia-frontend:v1.0.0-beta.5
+    image: docker.io/intelvia/intelvia-frontend:${INTELVIA_IMAGE_TAG:?INTELVIA_IMAGE_TAG is required}
+    restart: unless-stopped
+    environment:
+      BACKEND_UPSTREAM: backend
     ports:
       - "8080:8080"
     depends_on:

@@ -1,5 +1,16 @@
+# VM-local configuration and credentials; never generated or synchronized.
 .env
+.env.*
+!.env.example
+!.env.intelvia-app.example
+.docker/
+registry-credentials*
+
+# Persistent runtime data; never generated or synchronized.
 backend/parquet_cache/
+parquets/
+.deploy-state/
+backups/
 *.log
 *.zip
 *.DS_Store

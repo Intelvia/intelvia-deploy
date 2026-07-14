@@ -1,0 +1,22 @@
+# Paths whose changes require derived-table refresh and parquet regeneration.
+backend/api/migrations/**
+backend/api/models/**
+backend/api/models_derived/**
+backend/api/management/commands/generate_parquets.py
+backend/api/management/commands/migrate_derived_tables.py
+backend/api/management/commands/refresh_derived_tables.py
+backend/api/management/commands/validate_parquets.py
+backend/api/artifacts.py
+backend/api/parquet_contract.py
+backend/api/parquet_schemas.py
+backend/api/tasks.py
+backend/api/views/surgeries.py
+backend/api/views/utils/cpt_hierarchy.py
+backend/cpt-code-mapping.csv
+backend/cpt_codes_cleaned.csv
+backend/provider-department-mapping.csv
+frontend/src/Store/**
+frontend/src/Types/**
+frontend/src/App.tsx
+frontend/src/Components/Views/SettingsView/DataManagement/flagDefinitions.ts
+frontend/src/duckdb.ts

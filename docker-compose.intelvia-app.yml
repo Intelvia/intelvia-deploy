@@ -1,0 +1,89 @@
+name: ${COMPOSE_PROJECT_NAME:-intelvia}
+
+x-backend-common: &backend-common
+  image: docker.io/intelvia/intelvia-backend:${INTELVIA_IMAGE_TAG:?INTELVIA_IMAGE_TAG is required}
+  restart: unless-stopped
+  env_file:
+    - .env
+  environment:
+    INTELVIA_IMAGE_TAG: ${INTELVIA_IMAGE_TAG}
+    INTELVIA_SOURCE_COMMIT: ${INTELVIA_SOURCE_COMMIT:-unknown}
+    PARQUET_CACHE_DIR: /app/parquet_cache
+    RUN_STARTUP_MIGRATIONS: "false"
+  depends_on:
+    mariadb:
+      condition: service_healthy
+
+x-frontend-common: &frontend-common
+  image: docker.io/intelvia/intelvia-frontend:${INTELVIA_IMAGE_TAG:?INTELVIA_IMAGE_TAG is required}
+  restart: unless-stopped
+
+services:
+  mariadb:
+    image: docker.io/mariadb:11
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${MARIADB_DATABASE}
+      MARIADB_USER: ${MARIADB_USER}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD}
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - ./mariadb/conf.d:/etc/mysql/conf.d:ro,z
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -uroot --password=\"$${MARIADB_ROOT_PASSWORD}\" -e 'SELECT 1' >/dev/null 2>&1"]
+      start_period: 3s
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  backend-blue:
+    <<: *backend-common
+    volumes:
+      - ${BLUE_PARQUET_SET_PATH:?BLUE_PARQUET_SET_PATH is required}:/app/parquet_cache:ro,z
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+
+  backend-green:
+    <<: *backend-common
+    volumes:
+      - ${GREEN_PARQUET_SET_PATH:?GREEN_PARQUET_SET_PATH is required}:/app/parquet_cache:ro,z
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+
+  frontend-blue:
+    <<: *frontend-common
+    environment:
+      BACKEND_UPSTREAM: backend-blue
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      backend-blue:
+        condition: service_healthy
+
+  frontend-green:
+    <<: *frontend-common
+    environment:
+      BACKEND_UPSTREAM: backend-green
+    ports:
+      - "127.0.0.1:8081:8080"
+    depends_on:
+      backend-green:
+        condition: service_healthy
+
+  backend-tool:
+    <<: *backend-common
+    restart: "no"
+    profiles:
+      - tools
+    volumes:
+      - ${TOOL_PARQUET_SET_PATH:-./backend/parquet_cache}:/app/parquet_cache:z
+
+volumes:
+  mariadb_data:
