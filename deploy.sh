@@ -371,7 +371,7 @@ write_pending_state() {
 }
 
 reconcile_pending_deployment() {
-  [[ -f "$PENDING_FILE" ]] || return
+  [[ -f "$PENDING_FILE" ]] || return 0
   echo "Recovering interrupted deployment from $PENDING_FILE"
   # shellcheck disable=SC1090
   source "$PENDING_FILE"
