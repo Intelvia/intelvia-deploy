@@ -46,6 +46,7 @@ One-time VM prerequisites:
 - A production `.env` based on `.env.intelvia-app.example`.
 - Pull-only Docker Hub credentials stored in the GitHub production environment.
 - Existing parquets copied into `/srv/intelvia/parquets/sets/bootstrap`, or permission for the first deployment to run forced data preparation.
+- A writable `/srv/intelvia/scoped-artifacts` directory for version-keyed provider and multi-department artifacts. Source parquet sets remain read-only.
 
 The deploy workflow requires these GitHub environment secrets:
 
@@ -66,7 +67,11 @@ Data-impacting commits are detected with `detect-data-impact.sh` and `data-impac
 - `force`: always refresh derived tables and stage a new parquet set.
 - `reuse`: explicitly reuse the current set; manual operator override only.
 
-New files are generated under `/srv/intelvia/parquets/.staging/<image-tag>-<timestamp>`, validated, and promoted to the matching path under `/srv/intelvia/parquets/sets/` only during a healthy cutover. The timestamp preserves rollback identity when an operator force-regenerates data for the same image. Each set includes `manifest.json` with its producer, checksums, sizes, row counts, and Arrow schemas.
+New files are generated under `/srv/intelvia/parquets/.staging/<image-tag>-<timestamp>`, validated, and promoted to the matching path under `/srv/intelvia/parquets/sets/` only during a healthy cutover. The timestamp preserves rollback identity when an operator force-regenerates data for the same image. Each set includes `manifest.json` with its producer, checksums, sizes, row counts, and Arrow schemas. The deploy refuses data preparation unless it can retain the active set plus `MIN_PARQUET_FREE_BYTES` of headroom.
+
+The scheduled `Refresh intelvia.app production data` workflow runs daily at 02:00 UTC. It reuses the active image digests and exact deploy-package commit, then performs the same staged blue-green cutover in `force` mode. This replaces direct Celery writes into the active immutable parquet set.
+
+Backend and frontend tags are resolved to registry digests before Compose starts a candidate. Deployment state records those digests and the exact generated deploy-repository commit so rollback never depends on a tag or an unpinned `git pull`.
 
 Deployment state and rollback records live under `.deploy-state/`. List recorded IDs with:
 
@@ -80,8 +85,12 @@ Restore a recorded application/parquet pair with:
 bash rollback.sh <deployment-id>
 ```
 
-Rollback does not reverse Django migrations. Production migrations must remain compatible with the previous application for at least one deployment window.
+Rollback does not reverse Django migrations. Deployment state increments a schema generation whenever migration files change and refuses rollback to a state from another generation. A new forward deployment is required across that boundary.
 
-Unused images older than seven days are pruned after a successful deployment. A rollback whose local image was pruned pulls the recorded immutable tag again from Docker Hub.
+The newest `ROLLBACK_RETENTION_COUNT` successful states are retained, defaulting to five; older state files and their unreferenced parquet sets are removed together. Unused images older than seven days are pruned after a successful deployment. A rollback whose local image was pruned pulls its recorded digest again from Docker Hub.
+
+Before mutation, `deploy.sh` writes `.deploy-state/pending.env`. Signals run the same idempotent cleanup used for command failures. If the process or host disappears, the next deployment treats `current.env` as authoritative, restores nginx and the parquet pointer, restores backed-up derived tables, removes the candidate, and then continues. Do not edit `current.env` or `pending.env` manually.
+
+The public health endpoint validates MariaDB, global parquet schemas, and a write/delete probe in the scoped-artifact cache. Post-deploy authentication and representative department/provider access should still be exercised through the institution's non-PHI smoke accounts because the public probe cannot authenticate to CAS.
 
 Data-preparing releases retain pre-deployment database backups as daily, weekly, and monthly snapshots under `backups/`. Ordinary application-only releases skip this expensive dump along with derived refresh and parquet generation. These local snapshots do not replace encrypted off-VM backups and periodic restore testing.
