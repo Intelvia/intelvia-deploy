@@ -45,8 +45,8 @@ One-time VM prerequisites:
 - A clone of this deploy repository, normally `/home/deploy/intelvia-deploy`.
 - A production `.env` based on `.env.intelvia-app.example`.
 - Pull-only Docker Hub credentials stored in the GitHub production environment.
-- Existing parquets copied into `/srv/intelvia/parquets/sets/bootstrap`, or permission for the first deployment to run forced data preparation.
-- A writable `/srv/intelvia/scoped-artifacts` directory for version-keyed provider and multi-department artifacts. Source parquet sets remain read-only.
+- Existing parquets copied into `parquets/sets/bootstrap` under the deployment checkout, or permission for the first deployment to run forced data preparation.
+- A writable `scoped-artifacts/` directory under the deployment checkout for version-keyed provider and multi-department artifacts. Source parquet sets remain read-only.
 
 The deploy workflow requires these GitHub environment secrets:
 
@@ -67,7 +67,7 @@ Data-impacting commits are detected with `detect-data-impact.sh` and `data-impac
 - `force`: always refresh derived tables and stage a new parquet set.
 - `reuse`: explicitly reuse the current set; manual operator override only.
 
-New files are generated under `/srv/intelvia/parquets/.staging/<image-tag>-<timestamp>`, validated, and promoted to the matching path under `/srv/intelvia/parquets/sets/` only during a healthy cutover. The timestamp preserves rollback identity when an operator force-regenerates data for the same image. Each set includes `manifest.json` with its producer, checksums, sizes, row counts, and Arrow schemas. The deploy refuses data preparation unless it can retain the active set plus `MIN_PARQUET_FREE_BYTES` of headroom.
+New files are generated under `parquets/.staging/<image-tag>-<timestamp>` in the deployment checkout, validated, and promoted to the matching path under `parquets/sets/` only during a healthy cutover. The timestamp preserves rollback identity when an operator force-regenerates data for the same image. Each set includes `manifest.json` with its producer, checksums, sizes, row counts, and Arrow schemas. The deploy refuses data preparation unless it can retain the active set plus `MIN_PARQUET_FREE_BYTES` of headroom.
 
 The scheduled `Refresh intelvia.app production data` workflow runs daily at 02:00 UTC. It reuses the active image digests and exact deploy-package commit, then performs the same staged blue-green cutover in `force` mode. This replaces direct Celery writes into the active immutable parquet set.
 

@@ -9,9 +9,22 @@ else
   DEFAULT_APP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 fi
 APP_DIR="${APP_DIR:-$DEFAULT_APP_DIR}"
+cd "$APP_DIR"
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+else
+  echo "$APP_DIR/.env is required" >&2
+  exit 1
+fi
+
 STATE_DIR="${STATE_DIR:-$APP_DIR/.deploy-state}"
-PARQUET_ROOT="${PARQUET_ROOT:-/srv/intelvia/parquets}"
-SCOPED_ARTIFACT_CACHE_PATH="${SCOPED_ARTIFACT_CACHE_PATH:-/srv/intelvia/scoped-artifacts}"
+PARQUET_ROOT="${PARQUET_ROOT:-$APP_DIR/parquets}"
+SCOPED_ARTIFACT_CACHE_PATH="${SCOPED_ARTIFACT_CACHE_PATH:-$APP_DIR/scoped-artifacts}"
+[[ "$PARQUET_ROOT" == /* ]] || PARQUET_ROOT="$APP_DIR/${PARQUET_ROOT#./}"
+[[ "$SCOPED_ARTIFACT_CACHE_PATH" == /* ]] || SCOPED_ARTIFACT_CACHE_PATH="$APP_DIR/${SCOPED_ARTIFACT_CACHE_PATH#./}"
 NGINX_SITE_CONF="${NGINX_SITE_CONF:-/etc/nginx/sites-available/intelvia.app}"
 NGINX_SITE_ENABLED="${NGINX_SITE_ENABLED:-/etc/nginx/sites-enabled/intelvia.app}"
 NGINX_UPSTREAM_CONF="${NGINX_UPSTREAM_CONF:-/etc/nginx/snippets/intelvia-active-upstream.conf}"
@@ -68,7 +81,6 @@ done
 REQUESTED_DEPLOY_PACKAGE_COMMIT="$DEPLOY_PACKAGE_COMMIT"
 REQUESTED_MIGRATION_CHANGES="$MIGRATION_CHANGES"
 
-cd "$APP_DIR"
 mkdir -p "$STATE_DIR/history" "$PARQUET_ROOT/.staging" "$PARQUET_ROOT/sets" \
   "$SCOPED_ARTIFACT_CACHE_PATH" "$APP_DIR/backups"
 exec 9>"$STATE_DIR/deploy.lock"
@@ -78,15 +90,6 @@ if [[ "${DEPLOY_USE_SUDO:-1}" != "0" && "$(id -u)" != "0" ]]; then
   SUDO=(sudo)
 fi
 
-if [[ -f .env ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env
-  set +a
-else
-  echo "$APP_DIR/.env is required" >&2
-  exit 1
-fi
 mkdir -p "$SCOPED_ARTIFACT_CACHE_PATH"
 
 ACTIVE_COLOR="blue"

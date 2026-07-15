@@ -42,7 +42,7 @@ services:
     <<: *backend-common
     volumes:
       - ${BLUE_PARQUET_SET_PATH:?BLUE_PARQUET_SET_PATH is required}:/app/parquet_cache:ro,z
-      - ${SCOPED_ARTIFACT_CACHE_PATH:-/srv/intelvia/scoped-artifacts}:/app/scoped_artifact_cache:z
+      - ${SCOPED_ARTIFACT_CACHE_PATH:-./scoped-artifacts}:/app/scoped_artifact_cache:z
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/', timeout=3)"]
       interval: 5s
@@ -53,7 +53,7 @@ services:
     <<: *backend-common
     volumes:
       - ${GREEN_PARQUET_SET_PATH:?GREEN_PARQUET_SET_PATH is required}:/app/parquet_cache:ro,z
-      - ${SCOPED_ARTIFACT_CACHE_PATH:-/srv/intelvia/scoped-artifacts}:/app/scoped_artifact_cache:z
+      - ${SCOPED_ARTIFACT_CACHE_PATH:-./scoped-artifacts}:/app/scoped_artifact_cache:z
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/', timeout=3)"]
       interval: 5s
@@ -87,7 +87,7 @@ services:
       - tools
     volumes:
       - ${TOOL_PARQUET_SET_PATH:-./backend/parquet_cache}:/app/parquet_cache:z
-      - ${SCOPED_ARTIFACT_CACHE_PATH:-/srv/intelvia/scoped-artifacts}:/app/scoped_artifact_cache:z
+      - ${SCOPED_ARTIFACT_CACHE_PATH:-./scoped-artifacts}:/app/scoped_artifact_cache:z
 
 volumes:
   mariadb_data:
