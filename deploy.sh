@@ -485,7 +485,8 @@ write_pending_state
 
 echo "Pulling immutable images for $IMAGE_TAG"
 "${COMPOSE[@]}" pull backend-tool "$(backend_for_color "$NEXT_COLOR")" "$(frontend_for_color "$NEXT_COLOR")"
-"${COMPOSE[@]}" up -d mariadb
+echo "Starting MariaDB and waiting for it to become healthy"
+"${COMPOSE[@]}" up -d --wait --wait-timeout "$HEALTH_TIMEOUT" mariadb
 
 if [[ "$PREPARE_DATA" == "true" ]]; then
   active_set_bytes="$(du -sb "$ACTIVE_PARQUET_SET" 2>/dev/null | awk '{print $1}')"
