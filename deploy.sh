@@ -112,11 +112,33 @@ if [[ -f "$STATE_DIR/current.env" ]]; then
   STATE_LOADED=1
 fi
 if [[ "$RECOVER_ONLY" == "1" ]]; then
-  [[ "$STATE_LOADED" == "1" ]] || { echo "No deployment state exists to recover" >&2; exit 1; }
-  IMAGE_TAG="$ACTIVE_IMAGE_TAG"
-  SOURCE_COMMIT="$ACTIVE_SOURCE_COMMIT"
-  BACKEND_IMAGE="$ACTIVE_BACKEND_IMAGE"
-  FRONTEND_IMAGE="$ACTIVE_FRONTEND_IMAGE"
+  if [[ "$STATE_LOADED" == "0" && ! -f "$PENDING_FILE" ]]; then
+    echo "Deployment recovery complete"
+    exit 0
+  fi
+  if [[ "$STATE_LOADED" == "0" ]]; then
+    # A first deployment can fail after writing pending.env but before it has
+    # committed current.env. Seed only the Compose interpolation needed to
+    # stop the candidate and restore the journaled pre-cutover state.
+    # shellcheck disable=SC1090
+    source "$PENDING_FILE"
+    ACTIVE_COLOR="$PENDING_ACTIVE_COLOR"
+    ACTIVE_PARQUET_SET="$PENDING_ACTIVE_PARQUET_SET"
+    IMAGE_TAG="$PENDING_IMAGE_TAG"
+    SOURCE_COMMIT="${PENDING_SOURCE_COMMIT:-unknown}"
+    DEPLOY_PACKAGE_COMMIT="${PENDING_DEPLOY_PACKAGE_COMMIT:-}"
+    if [[ -z "$DEPLOY_PACKAGE_COMMIT" ]]; then
+      DEPLOY_PACKAGE_COMMIT="$(git rev-parse HEAD 2>/dev/null || printf '0%.0s' {1..40})"
+    fi
+    recovery_digest="$(printf '0%.0s' {1..64})"
+    BACKEND_IMAGE="${PENDING_BACKEND_IMAGE:-docker.io/intelvia/intelvia-backend@sha256:$recovery_digest}"
+    FRONTEND_IMAGE="${PENDING_FRONTEND_IMAGE:-docker.io/intelvia/intelvia-frontend@sha256:$recovery_digest}"
+  else
+    IMAGE_TAG="$ACTIVE_IMAGE_TAG"
+    SOURCE_COMMIT="$ACTIVE_SOURCE_COMMIT"
+    BACKEND_IMAGE="$ACTIVE_BACKEND_IMAGE"
+    FRONTEND_IMAGE="$ACTIVE_FRONTEND_IMAGE"
+  fi
   DATA_PREPARATION_MODE="reuse"
   DATA_CHANGES="false"
   MIGRATION_CHANGES="false"
@@ -358,6 +380,10 @@ write_pending_state() {
     printf 'PENDING_MIGRATION_ATTEMPTED=%q\n' "$MIGRATION_ATTEMPTED"
     printf 'PENDING_SCHEMA_GENERATION=%q\n' "$CANDIDATE_SCHEMA_GENERATION"
     printf 'PENDING_IMAGE_TAG=%q\n' "$IMAGE_TAG"
+    printf 'PENDING_SOURCE_COMMIT=%q\n' "$SOURCE_COMMIT"
+    printf 'PENDING_DEPLOY_PACKAGE_COMMIT=%q\n' "$DEPLOY_PACKAGE_COMMIT"
+    printf 'PENDING_BACKEND_IMAGE=%q\n' "$BACKEND_IMAGE"
+    printf 'PENDING_FRONTEND_IMAGE=%q\n' "$FRONTEND_IMAGE"
     printf 'PENDING_TARGET_DEPLOYMENT_ID=%q\n' "$timestamp-$IMAGE_TAG"
   } > "$PENDING_FILE.tmp"
   mv "$PENDING_FILE.tmp" "$PENDING_FILE"
