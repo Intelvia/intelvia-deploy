@@ -239,14 +239,7 @@ smoke_candidate_frontend() {
 
 smoke_candidate_auth() {
   local base_url="$1"
-  local headers_file="$STATE_DIR/.candidate-auth-$timestamp.headers"
-  local status
-  status="$(curl -sS --max-time 8 -D "$headers_file" -o /dev/null -w '%{http_code}' \
-    -H 'Host: intelvia.app' -H 'X-Forwarded-Proto: https' "$base_url/api/me")"
-  [[ "$status" == "302" ]] || { echo "Candidate auth endpoint did not redirect to CAS" >&2; return 1; }
-  rg -i -q '^location: https://go\.utah\.edu/cas/' "$headers_file" \
-    || { echo "Candidate auth endpoint returned an unexpected CAS location" >&2; return 1; }
-  rm -f "$headers_file"
+  "$SCRIPT_DIR/check-cas-redirect.sh" "$base_url"
 }
 
 NEXT_COLOR="$(other_color "$ACTIVE_COLOR")"
