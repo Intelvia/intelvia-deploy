@@ -259,7 +259,7 @@ smoke_candidate_frontend() {
   rm -f "$index_file" "$bundle_file"
 }
 
-smoke_candidate_auth() {
+smoke_auth() {
   local base_url="$1"
   "$SCRIPT_DIR/check-cas-redirect.sh" "$base_url"
 }
@@ -580,7 +580,7 @@ echo "Starting inactive $NEXT_COLOR application pair"
 
 deadline=$((SECONDS + HEALTH_TIMEOUT))
 until smoke_candidate_frontend "http://127.0.0.1:$NEXT_PORT" \
-  && smoke_candidate_auth "http://127.0.0.1:$NEXT_PORT" \
+  && smoke_auth "http://127.0.0.1:$NEXT_PORT" \
   && curl -fsS --max-time 4 -H 'Host: intelvia.app' -H 'X-Forwarded-Proto: https' "http://127.0.0.1:$NEXT_PORT/health/" >/dev/null \
   && curl -fsS --max-time 8 -H 'Host: intelvia.app' -H 'X-Forwarded-Proto: https' "http://127.0.0.1:$NEXT_PORT/api/health/" >/dev/null; do
   (( SECONDS < deadline )) || { echo "Candidate health check timed out" >&2; false; }
@@ -620,7 +620,8 @@ mv -Tf "$current_link_tmp" "$PARQUET_ROOT/current"
 POINTER_CHANGED=1
 
 if ! curl -fsS --max-time 15 "$PUBLIC_BASE_URL/health/" >/dev/null \
-  || ! curl -fsS --max-time 20 "$PUBLIC_BASE_URL/api/health/" >/dev/null; then
+  || ! curl -fsS --max-time 20 "$PUBLIC_BASE_URL/api/health/" >/dev/null \
+  || ! smoke_auth "$PUBLIC_BASE_URL"; then
   false
 fi
 deployment_id="$timestamp-$IMAGE_TAG"
