@@ -432,7 +432,7 @@ reconcile_pending_deployment() {
   restore_derived_tables
   if [[ -n "$PENDING_NEW_PARQUET_PATH" && "$PENDING_NEW_PARQUET_PATH" != "$PENDING_ACTIVE_PARQUET_SET" \
     && ( "$PENDING_NEW_PARQUET_PATH" == "$PARQUET_ROOT/.staging/"* || "$PENDING_NEW_PARQUET_PATH" == "$PARQUET_ROOT/sets/"* ) ]]; then
-    rm -rf -- "$PENDING_NEW_PARQUET_PATH" || true
+    "${SUDO[@]}" rm -rf -- "$PENDING_NEW_PARQUET_PATH" || true
   fi
   if [[ "$PENDING_MIGRATION_CHANGES" == "true" && "$PENDING_MIGRATION_ATTEMPTED" == "1" && -f "$STATE_DIR/current.env" ]]; then
     sed -i.bak -e '/^MIGRATION_CHANGES=/d' -e '/^SCHEMA_GENERATION=/d' "$STATE_DIR/current.env"
@@ -458,7 +458,7 @@ cleanup_failed_deployment() {
     restore_derived_tables
     if [[ -n "$NEW_PARQUET_PATH" && "$NEW_PARQUET_PATH" != "$ACTIVE_PARQUET_SET" \
       && ( "$NEW_PARQUET_PATH" == "$PARQUET_ROOT/.staging/"* || "$NEW_PARQUET_PATH" == "$PARQUET_ROOT/sets/"* ) ]]; then
-      rm -rf -- "$NEW_PARQUET_PATH" || true
+      "${SUDO[@]}" rm -rf -- "$NEW_PARQUET_PATH" || true
     fi
     {
       printf 'FAILED_AT=%q\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -508,7 +508,7 @@ echo "Starting MariaDB and waiting for it to become healthy"
 "${COMPOSE[@]}" up -d --wait --wait-timeout "$HEALTH_TIMEOUT" mariadb
 
 if [[ "$PREPARE_DATA" == "true" ]]; then
-  active_set_bytes="$(du -sb "$ACTIVE_PARQUET_SET" 2>/dev/null | awk '{print $1}')"
+  active_set_bytes="$("${SUDO[@]}" du -sb "$ACTIVE_PARQUET_SET" 2>/dev/null | awk '{print $1}')"
   active_set_bytes="${active_set_bytes:-0}"
   available_bytes="$(df -PB1 "$PARQUET_ROOT" | awk 'NR == 2 {print $4}')"
   required_bytes=$((active_set_bytes + MIN_PARQUET_FREE_BYTES))
@@ -545,7 +545,7 @@ if [[ "$PREPARE_DATA" == "true" ]]; then
     echo "Refusing to prepare data outside the parquet staging root" >&2
     exit 1
   }
-  rm -rf "$CANDIDATE_PARQUET_SET"
+  "${SUDO[@]}" rm -rf "$CANDIDATE_PARQUET_SET"
   mkdir -p "$CANDIDATE_PARQUET_SET"
   DERIVED_BACKUP="$APP_DIR/backups/derived-$timestamp.sql"
   existing_derived="$("${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
@@ -571,7 +571,8 @@ if [[ "$PREPARE_DATA" == "true" ]]; then
   "${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py generate_parquets
   "${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py validate_parquets \
     --image-tag "$IMAGE_TAG" --source-commit "$SOURCE_COMMIT" --write-manifest
-  "${COMPOSE[@]}" run --rm backend-tool chmod -R go-rwx /app/parquet_cache
+  "${SUDO[@]}" chown -R "$(id -u):$(id -g)" "$CANDIDATE_PARQUET_SET"
+  chmod -R u+rwX,go-rwx "$CANDIDATE_PARQUET_SET"
 fi
 
 echo "Starting inactive $NEXT_COLOR application pair"
@@ -658,7 +659,7 @@ for ((history_index = ROLLBACK_RETENTION_COUNT; history_index < ${#successful_hi
 done
 for stale_staging in "$PARQUET_ROOT/.staging/"*; do
   [[ -e "$stale_staging" ]] || continue
-  rm -rf -- "$stale_staging" || true
+  "${SUDO[@]}" rm -rf -- "$stale_staging" || true
 done
 for parquet_set in "$PARQUET_ROOT/sets/"*; do
   [[ -d "$parquet_set" ]] || continue
@@ -669,7 +670,7 @@ for parquet_set in "$PARQUET_ROOT/sets/"*; do
     || grep -F -R -q -- "$parquet_set" "$STATE_DIR/current.env" "$STATE_DIR/history" 2>/dev/null; then
     continue
   fi
-  rm -rf -- "$parquet_set" || true
+  "${SUDO[@]}" rm -rf -- "$parquet_set" || true
 done
 docker image prune -a -f --filter "until=${IMAGE_PRUNE_AGE:-168h}" || true
 echo "Deployment complete: id=$deployment_id color=$NEXT_COLOR image=$IMAGE_TAG parquets=$CANDIDATE_PARQUET_SET prepared=$PREPARE_DATA"
