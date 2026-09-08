@@ -46,7 +46,6 @@ One-time VM prerequisites:
 - A production `.env` based on `.env.intelvia-app.example`.
 - Pull-only Docker Hub credentials stored in the GitHub production environment.
 - Existing parquets copied into `parquets/sets/bootstrap` under the deployment checkout, or permission for the first deployment to run forced data preparation.
-- A writable `scoped-artifacts/` directory under the deployment checkout for version-keyed provider and multi-department artifacts. Source parquet sets remain read-only.
 
 The deploy workflow requires these GitHub environment secrets:
 
@@ -59,7 +58,7 @@ Pin `PRODUCTION_DEPLOY_KNOWN_HOSTS` out of band and keep `StrictHostKeyChecking=
 
 ## Blue-green and parquet behavior
 
-The deployment script keeps one MariaDB service and switches between blue/green frontend/backend pairs on ports 8080 and 8081. Nginx reads `/etc/nginx/snippets/intelvia-active-upstream.conf` and is changed only after the inactive pair serves the requested immutable frontend bundle and passes frontend and database/parquet-aware backend health checks.
+The deployment script keeps one MariaDB service and switches between blue/green frontend/backend pairs on ports 8080 and 8081. Each backend mounts its parquet set read-write at `/app/parquet_cache`; generated scoped artifacts live under `/app/parquet_cache/user_artifacts`. Nginx reads `/etc/nginx/snippets/intelvia-active-upstream.conf` and is changed only after the inactive pair serves the requested frontend bundle and passes frontend and database/parquet-aware backend health checks.
 
 Data-impacting commits are detected with `detect-data-impact.sh` and `data-impact-paths.txt`. The supported modes are:
 
@@ -91,6 +90,6 @@ The newest `ROLLBACK_RETENTION_COUNT` successful states are retained, defaulting
 
 Before mutation, `deploy.sh` writes `.deploy-state/pending.env`. Signals run the same idempotent cleanup used for command failures. If the process or host disappears, the next deployment treats `current.env` as authoritative, restores nginx and the parquet pointer, restores backed-up derived tables, removes the candidate, and then continues. Do not edit `current.env` or `pending.env` manually.
 
-The public health endpoint validates MariaDB, global parquet schemas, and a write/delete probe in the scoped-artifact cache. Deployment also checks the authentication mode configured in the VM-local `.env`: `DJANGO_DISABLE_LOGINS=True` must return the login-disabled access payload, while `False` must reach CAS through the redirect chain. Representative department/provider access should still be exercised through the institution's non-PHI smoke accounts when CAS is enabled.
+The public health endpoint validates MariaDB, global parquet schemas, and a write/delete probe in `/app/parquet_cache/user_artifacts`. Deployment also checks the authentication mode configured in the VM-local `.env`: `DJANGO_DISABLE_LOGINS=True` must return the login-disabled access payload, while `False` must reach CAS through the redirect chain. Representative department/provider access should still be exercised through the institution's non-PHI smoke accounts when CAS is enabled.
 
 Data-preparing releases retain pre-deployment database backups as daily, weekly, and monthly snapshots under `backups/`. Ordinary application-only releases skip this expensive dump along with derived refresh and parquet generation. These local snapshots do not replace encrypted off-VM backups and periodic restore testing.
