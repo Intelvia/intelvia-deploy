@@ -331,15 +331,18 @@ restore_derived_tables() {
   if [[ "$DERIVED_MUTATED" != "1" ]]; then
     return
   fi
-  if [[ "$DERIVED_ORIGINAL_STATE" == "three" && -s "$DERIVED_BACKUP" ]]; then
+  if [[ ( "$DERIVED_ORIGINAL_STATE" == "three" || "$DERIVED_ORIGINAL_STATE" == "four" ) && -s "$DERIVED_BACKUP" ]]; then
       echo "Restoring pre-deployment derived tables"
+      "${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
+        mariadb -uroot "$MARIADB_DATABASE" \
+        -e 'DROP TABLE IF EXISTS GuidelineAdherenceFacts, GuidelineAdherence, VisitAttributes, SurgeryCaseAttributes' || true
       "${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
         mariadb -uroot "$MARIADB_DATABASE" < "$DERIVED_BACKUP" || true
   elif [[ "$DERIVED_ORIGINAL_STATE" == "zero" ]]; then
       echo "Removing derived tables created by the failed deployment"
       "${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
         mariadb -uroot "$MARIADB_DATABASE" \
-        -e 'DROP TABLE IF EXISTS GuidelineAdherence, VisitAttributes, SurgeryCaseAttributes' || true
+        -e 'DROP TABLE IF EXISTS GuidelineAdherenceFacts, GuidelineAdherence, VisitAttributes, SurgeryCaseAttributes' || true
   fi
 }
 
@@ -544,8 +547,14 @@ if [[ "$PREPARE_DATA" == "true" ]]; then
   mkdir -p "$CANDIDATE_PARQUET_SET"
   DERIVED_BACKUP="$APP_DIR/backups/derived-$timestamp.sql"
   existing_derived="$("${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
-    mariadb -N -uroot -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$MARIADB_DATABASE' AND table_name IN ('GuidelineAdherence','VisitAttributes','SurgeryCaseAttributes')")"
-  if [[ "$existing_derived" == "3" ]]; then
+    mariadb -N -uroot -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$MARIADB_DATABASE' AND table_name IN ('GuidelineAdherenceFacts','GuidelineAdherence','VisitAttributes','SurgeryCaseAttributes')")"
+  if [[ "$existing_derived" == "4" ]]; then
+    DERIVED_ORIGINAL_STATE="four"
+    "${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
+      mariadb-dump -uroot --single-transaction "$MARIADB_DATABASE" \
+      GuidelineAdherenceFacts GuidelineAdherence VisitAttributes SurgeryCaseAttributes > "$DERIVED_BACKUP"
+    chmod 0600 "$DERIVED_BACKUP"
+  elif [[ "$existing_derived" == "3" ]]; then
     DERIVED_ORIGINAL_STATE="three"
     "${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
       mariadb-dump -uroot --single-transaction "$MARIADB_DATABASE" \
@@ -554,7 +563,7 @@ if [[ "$PREPARE_DATA" == "true" ]]; then
   elif [[ "$existing_derived" == "0" ]]; then
     DERIVED_ORIGINAL_STATE="zero"
   elif [[ "$existing_derived" != "0" ]]; then
-    echo "Expected zero or three SQL-managed derived tables, found $existing_derived" >&2
+    echo "Expected zero, three, or four SQL-managed derived tables, found $existing_derived" >&2
     false
   fi
   DERIVED_MUTATED=1
