@@ -31,7 +31,7 @@ HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-180}"
 ROLLBACK_RETENTION_COUNT="${ROLLBACK_RETENTION_COUNT:-5}"
 MIN_PARQUET_FREE_BYTES="${MIN_PARQUET_FREE_BYTES:-5368709120}"
 COMPOSE=(docker compose -p intelvia -f docker-compose.intelvia-app.yml --profile tools)
-SUDO=()
+SUDO=(env)
 
 IMAGE_TAG=""
 SOURCE_COMMIT=""
@@ -46,6 +46,10 @@ FRONTEND_IMAGE=""
 DERIVED_MUTATED=0
 DERIVED_BACKUP=""
 DERIVED_ORIGINAL_STATE="unknown"
+DERIVED_ORIGINAL_TABLES=""
+DERIVED_ROLLBACK_BACKUP=""
+DERIVED_ROLLBACK_ORIGINAL_STATE=""
+DERIVED_ROLLBACK_TABLES=""
 CUTOVER_COMPLETE=0
 UPSTREAM_CHANGED=0
 POINTER_CHANGED=0
@@ -53,7 +57,19 @@ SITE_CONFIG_CHANGED=0
 OLD_UPSTREAM=""
 NEW_PARQUET_PATH=""
 MIGRATION_ATTEMPTED=0
+GUIDELINE_UPDATES_PAUSED=0
 PENDING_FILE="$STATE_DIR/pending.env"
+DERIVED_TABLES=(
+  GuidelineAdherenceFacts
+  GuidelineAdherence
+  SurgeryCaseOutcomes
+  VisitAttributes
+  SurgeryCaseAttributes
+)
+printf -v DERIVED_TABLES_SQL "'%s'," "${DERIVED_TABLES[@]}"
+DERIVED_TABLES_SQL="${DERIVED_TABLES_SQL%,}"
+printf -v DERIVED_TABLES_CSV "%s," "${DERIVED_TABLES[@]}"
+DERIVED_TABLES_CSV="${DERIVED_TABLES_CSV%,}"
 
 usage() {
   echo "Usage: $0 --image-tag TAG --source-commit SHA --package-commit SHA [--mode auto|force|reuse] [--data-changes true|false] [--migration-changes true|false]" >&2
@@ -95,6 +111,16 @@ ACTIVE_PARQUET_SET=""
 ACTIVE_BACKEND_IMAGE=""
 ACTIVE_FRONTEND_IMAGE=""
 SCHEMA_GENERATION=0
+GUIDELINE_CONFIG_VERSION=""
+GUIDELINE_PREVIOUS_PUBLISHED_VERSION=""
+GUIDELINE_PREVIOUS_CACHE_VERSION=""
+GUIDELINE_PREVIOUS_STATUS=""
+GUIDELINE_PUBLISHED_VERSION=""
+GUIDELINE_CACHE_VERSION=""
+GUIDELINE_STATUS=""
+GUIDELINE_TARGET_PUBLISHED_VERSION=""
+GUIDELINE_TARGET_CACHE_VERSION=""
+GUIDELINE_TARGET_STATUS=""
 DEPLOY_PACKAGE_COMMIT="${DEPLOY_PACKAGE_COMMIT:-}"
 MIGRATION_CHANGES="${MIGRATION_CHANGES:-false}"
 PREVIOUS_COLOR=""
@@ -178,6 +204,10 @@ if [[ -n "$ROLLBACK_STATE" ]]; then
   CURRENT_DEPLOY_PACKAGE_COMMIT="$DEPLOY_PACKAGE_COMMIT"
   CURRENT_MIGRATION_CHANGES="$MIGRATION_CHANGES"
   CURRENT_SCHEMA_GENERATION="$SCHEMA_GENERATION"
+  CURRENT_PREVIOUS_PARQUET_SET="$PREVIOUS_PARQUET_SET"
+  CURRENT_DERIVED_ROLLBACK_BACKUP="${DERIVED_ROLLBACK_BACKUP:-}"
+  CURRENT_DERIVED_ROLLBACK_ORIGINAL_STATE="${DERIVED_ROLLBACK_ORIGINAL_STATE:-}"
+  CURRENT_DERIVED_ROLLBACK_TABLES="${DERIVED_ROLLBACK_TABLES:-}"
   # shellcheck disable=SC1090
   source "$rollback_file"
   TARGET_IMAGE_TAG="$ACTIVE_IMAGE_TAG"
@@ -206,6 +236,26 @@ if [[ -n "$ROLLBACK_STATE" ]]; then
   MIGRATION_CHANGES="false"
   CANDIDATE_SCHEMA_GENERATION="$TARGET_SCHEMA_GENERATION"
   DATA_PREPARATION_MODE="reuse"
+  ROLLBACK_RESTORES_DERIVED=0
+  if [[ "$TARGET_PARQUET_SET" != "$CURRENT_ACTIVE_PARQUET_SET" ]]; then
+    if [[ "$TARGET_PARQUET_SET" != "$CURRENT_PREVIOUS_PARQUET_SET" ]]; then
+      echo "Data rollback is limited to the immediately previous parquet generation" >&2
+      exit 1
+    fi
+    if [[ "$CURRENT_DERIVED_ROLLBACK_ORIGINAL_STATE" == "present" ]]; then
+      [[ -s "$CURRENT_DERIVED_ROLLBACK_BACKUP" ]] || {
+        echo "The retained rollback state is missing its derived-table snapshot" >&2
+        exit 1
+      }
+    elif [[ "$CURRENT_DERIVED_ROLLBACK_ORIGINAL_STATE" != "zero" ]]; then
+      echo "The retained rollback state has no usable derived-table snapshot" >&2
+      exit 1
+    fi
+    ROLLBACK_RESTORES_DERIVED=1
+    ROLLBACK_DERIVED_BACKUP="$CURRENT_DERIVED_ROLLBACK_BACKUP"
+    ROLLBACK_DERIVED_ORIGINAL_STATE="$CURRENT_DERIVED_ROLLBACK_ORIGINAL_STATE"
+    ROLLBACK_DERIVED_TABLES="$CURRENT_DERIVED_ROLLBACK_TABLES"
+  fi
 fi
 
 [[ "$IMAGE_TAG" =~ ^sha-[0-9a-f]{40}$ || "$IMAGE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
@@ -327,23 +377,114 @@ else
 fi
 export BLUE_PARQUET_SET_PATH GREEN_PARQUET_SET_PATH
 
+query_derived_tables() {
+  "${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
+    mariadb -N -uroot \
+    -e "SELECT table_name FROM information_schema.tables WHERE table_schema='$MARIADB_DATABASE' AND table_name IN ($DERIVED_TABLES_SQL) ORDER BY FIELD(table_name, $DERIVED_TABLES_SQL)"
+}
+
+backup_derived_tables() {
+  local backup_path="$1"
+  local existing_derived
+  local existing_derived_tables=()
+
+  existing_derived="$(query_derived_tables)"
+  DERIVED_ORIGINAL_TABLES="$existing_derived"
+  if [[ -n "$existing_derived" ]]; then
+    while IFS= read -r table_name; do
+      existing_derived_tables+=("$table_name")
+    done <<< "$existing_derived"
+    DERIVED_ORIGINAL_STATE="present"
+    "${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
+      mariadb-dump -uroot --single-transaction "$MARIADB_DATABASE" \
+      "${existing_derived_tables[@]}" > "$backup_path"
+    chmod 0600 "$backup_path"
+  else
+    DERIVED_ORIGINAL_STATE="zero"
+    rm -f "$backup_path"
+  fi
+}
+
+restore_derived_snapshot() {
+  local original_state="$1"
+  local backup_path="$2"
+  local expected_tables="$3"
+  local restored_tables
+
+  if [[ "$original_state" == "three" ]]; then
+    original_state="present"
+    expected_tables=$'GuidelineAdherence\nVisitAttributes\nSurgeryCaseAttributes'
+  elif [[ "$original_state" == "four" ]]; then
+    original_state="present"
+    expected_tables=$'GuidelineAdherenceFacts\nGuidelineAdherence\nVisitAttributes\nSurgeryCaseAttributes'
+  fi
+
+  if [[ "$original_state" == "present" ]]; then
+    [[ -s "$backup_path" ]] || {
+      echo "Derived-table snapshot is missing or empty: $backup_path" >&2
+      return 1
+    }
+    [[ -n "$expected_tables" ]] || {
+      echo "Derived-table snapshot has no expected table inventory" >&2
+      return 1
+    }
+    echo "Restoring pre-deployment derived tables"
+    "${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
+      mariadb -uroot "$MARIADB_DATABASE" \
+      -e "DROP TABLE IF EXISTS $DERIVED_TABLES_CSV"
+    "${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
+      mariadb -uroot "$MARIADB_DATABASE" < "$backup_path"
+  elif [[ "$original_state" == "zero" ]]; then
+    echo "Removing derived tables created by the failed deployment"
+    "${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
+      mariadb -uroot "$MARIADB_DATABASE" \
+      -e "DROP TABLE IF EXISTS $DERIVED_TABLES_CSV"
+  else
+    echo "Unknown derived-table restore state: $original_state" >&2
+    return 1
+  fi
+
+  restored_tables="$(query_derived_tables)"
+  if [[ "$restored_tables" != "$expected_tables" ]]; then
+    echo "Derived-table restore verification failed" >&2
+    echo "Expected tables: ${expected_tables:-<none>}" >&2
+    echo "Restored tables: ${restored_tables:-<none>}" >&2
+    return 1
+  fi
+}
+
 restore_derived_tables() {
   if [[ "$DERIVED_MUTATED" != "1" ]]; then
     return
   fi
-  if [[ ( "$DERIVED_ORIGINAL_STATE" == "three" || "$DERIVED_ORIGINAL_STATE" == "four" ) && -s "$DERIVED_BACKUP" ]]; then
-      echo "Restoring pre-deployment derived tables"
-      "${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
-        mariadb -uroot "$MARIADB_DATABASE" \
-        -e 'DROP TABLE IF EXISTS GuidelineAdherenceFacts, GuidelineAdherence, VisitAttributes, SurgeryCaseAttributes' || true
-      "${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
-        mariadb -uroot "$MARIADB_DATABASE" < "$DERIVED_BACKUP" || true
-  elif [[ "$DERIVED_ORIGINAL_STATE" == "zero" ]]; then
-      echo "Removing derived tables created by the failed deployment"
-      "${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
-        mariadb -uroot "$MARIADB_DATABASE" \
-        -e 'DROP TABLE IF EXISTS GuidelineAdherenceFacts, GuidelineAdherence, VisitAttributes, SurgeryCaseAttributes' || true
-  fi
+  restore_derived_snapshot \
+    "$DERIVED_ORIGINAL_STATE" \
+    "$DERIVED_BACKUP" \
+    "$DERIVED_ORIGINAL_TABLES"
+}
+
+copy_guideline_overlay_generation() {
+  local source_set="$1"
+  local target_set="$2"
+  local cache_version="$3"
+  local file_name
+
+  [[ -n "$cache_version" ]] || return 0
+  [[ "$cache_version" != */* && "$cache_version" != "." && "$cache_version" != ".." ]] || {
+    echo "Invalid guideline overlay cache version" >&2
+    return 1
+  }
+  for file_name in \
+    "guideline_adherence_overlay.v${cache_version}.parquet" \
+    "guideline_adherence_overlay.v${cache_version}.json"; do
+    [[ -f "$source_set/$file_name" ]] || {
+      echo "Active guideline overlay generation is incomplete: $source_set/$file_name" >&2
+      return 1
+    }
+    if [[ "$source_set" != "$target_set" ]]; then
+      cp -p "$source_set/$file_name" "$target_set/$file_name"
+    fi
+  done
 }
 
 restore_nginx_config() {
@@ -374,6 +515,7 @@ write_pending_state() {
     printf 'PENDING_DERIVED_MUTATED=%q\n' "$DERIVED_MUTATED"
     printf 'PENDING_DERIVED_BACKUP=%q\n' "$DERIVED_BACKUP"
     printf 'PENDING_DERIVED_ORIGINAL_STATE=%q\n' "$DERIVED_ORIGINAL_STATE"
+    printf 'PENDING_DERIVED_ORIGINAL_TABLES=%q\n' "$DERIVED_ORIGINAL_TABLES"
     printf 'PENDING_MIGRATION_CHANGES=%q\n' "$MIGRATION_CHANGES"
     printf 'PENDING_MIGRATION_ATTEMPTED=%q\n' "$MIGRATION_ATTEMPTED"
     printf 'PENDING_SCHEMA_GENERATION=%q\n' "$CANDIDATE_SCHEMA_GENERATION"
@@ -383,8 +525,45 @@ write_pending_state() {
     printf 'PENDING_BACKEND_IMAGE=%q\n' "$BACKEND_IMAGE"
     printf 'PENDING_FRONTEND_IMAGE=%q\n' "$FRONTEND_IMAGE"
     printf 'PENDING_TARGET_DEPLOYMENT_ID=%q\n' "$timestamp-$IMAGE_TAG"
+    printf 'PENDING_GUIDELINE_CONFIG_VERSION=%q\n' "$GUIDELINE_CONFIG_VERSION"
+    printf 'PENDING_GUIDELINE_PREVIOUS_PUBLISHED_VERSION=%q\n' "$GUIDELINE_PREVIOUS_PUBLISHED_VERSION"
+    printf 'PENDING_GUIDELINE_PREVIOUS_CACHE_VERSION=%q\n' "$GUIDELINE_PREVIOUS_CACHE_VERSION"
+    printf 'PENDING_GUIDELINE_PREVIOUS_STATUS=%q\n' "$GUIDELINE_PREVIOUS_STATUS"
+    printf 'PENDING_GUIDELINE_UPDATES_PAUSED=%q\n' "$GUIDELINE_UPDATES_PAUSED"
   } > "$PENDING_FILE.tmp"
   mv "$PENDING_FILE.tmp" "$PENDING_FILE"
+}
+
+pause_guideline_updates() {
+  local barrier_result
+
+  "${SUDO[@]}" touch "$ACTIVE_PARQUET_SET/.guideline-settings-paused"
+  GUIDELINE_UPDATES_PAUSED=1
+  barrier_result="$("${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
+    mariadb -N -uroot "$MARIADB_DATABASE" \
+    -e "SELECT GET_LOCK('intelvia-guideline-adherence-publish', 600); SELECT RELEASE_LOCK('intelvia-guideline-adherence-publish')")"
+  [[ "$barrier_result" == $'1\n1' ]] || {
+    echo "Could not establish the guideline publication deployment barrier" >&2
+    return 1
+  }
+}
+
+pause_candidate_guideline_updates() {
+  "${SUDO[@]}" touch "$CANDIDATE_PARQUET_SET/.guideline-settings-paused"
+}
+
+resume_guideline_updates() {
+  "${SUDO[@]}" rm -f "$ACTIVE_PARQUET_SET/.guideline-settings-paused"
+  if [[ -n "${CANDIDATE_PARQUET_SET:-}" ]]; then
+    "${SUDO[@]}" rm -f "$CANDIDATE_PARQUET_SET/.guideline-settings-paused"
+  fi
+  [[ ! -e "$ACTIVE_PARQUET_SET/.guideline-settings-paused" \
+    && ( -z "${CANDIDATE_PARQUET_SET:-}" \
+      || ! -e "$CANDIDATE_PARQUET_SET/.guideline-settings-paused" ) ]] || {
+    echo "Guideline update pause marker could not be removed" >&2
+    return 1
+  }
+  GUIDELINE_UPDATES_PAUSED=0
 }
 
 reconcile_pending_deployment() {
@@ -406,10 +585,20 @@ reconcile_pending_deployment() {
     mv -Tf "$committed_link" "$PARQUET_ROOT/current"
     "${COMPOSE[@]}" stop "$(frontend_for_color "$(other_color "$ACTIVE_COLOR")")" \
       "$(backend_for_color "$(other_color "$ACTIVE_COLOR")")" >/dev/null 2>&1 || true
+    "${SUDO[@]}" rm -f "$ACTIVE_PARQUET_SET/.guideline-settings-paused" \
+      "$PENDING_ACTIVE_PARQUET_SET/.guideline-settings-paused"
     rm -f "$PENDING_FILE"
     NGINX_ACTIVE_COLOR="$ACTIVE_COLOR"
     echo "Interrupted deployment had already committed; reconciled to $ACTIVE_COLOR"
     return
+  fi
+  if [[ -n "${PENDING_GUIDELINE_CONFIG_VERSION:-}" ]]; then
+    "${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py restore_guideline_publication \
+      --expected-version "$PENDING_GUIDELINE_CONFIG_VERSION" \
+      --published-version "$PENDING_GUIDELINE_PREVIOUS_PUBLISHED_VERSION" \
+      --cache-version "$PENDING_GUIDELINE_PREVIOUS_CACHE_VERSION" \
+      --status "$PENDING_GUIDELINE_PREVIOUS_STATUS" \
+      --strict
   fi
   printf 'server 127.0.0.1:%s;\n' "$(port_for_color "$PENDING_ACTIVE_COLOR")" \
     | "${SUDO[@]}" tee "$NGINX_UPSTREAM_CONF.new" >/dev/null
@@ -427,6 +616,7 @@ reconcile_pending_deployment() {
   DERIVED_MUTATED="$PENDING_DERIVED_MUTATED"
   DERIVED_BACKUP="$PENDING_DERIVED_BACKUP"
   DERIVED_ORIGINAL_STATE="$PENDING_DERIVED_ORIGINAL_STATE"
+  DERIVED_ORIGINAL_TABLES="${PENDING_DERIVED_ORIGINAL_TABLES:-}"
   restore_derived_tables
   if [[ -n "$PENDING_NEW_PARQUET_PATH" && "$PENDING_NEW_PARQUET_PATH" != "$PENDING_ACTIVE_PARQUET_SET" \
     && ( "$PENDING_NEW_PARQUET_PATH" == "$PARQUET_ROOT/.staging/"* || "$PENDING_NEW_PARQUET_PATH" == "$PARQUET_ROOT/sets/"* ) ]]; then
@@ -437,6 +627,10 @@ reconcile_pending_deployment() {
     printf 'MIGRATION_CHANGES=true\nSCHEMA_GENERATION=%q\n' "$PENDING_SCHEMA_GENERATION" >> "$STATE_DIR/current.env"
     rm -f "$STATE_DIR/current.env.bak"
   fi
+  "${SUDO[@]}" rm -f "$PENDING_ACTIVE_PARQUET_SET/.guideline-settings-paused"
+  if [[ -n "$PENDING_NEW_PARQUET_PATH" ]]; then
+    "${SUDO[@]}" rm -f "$PENDING_NEW_PARQUET_PATH/.guideline-settings-paused"
+  fi
   rm -f "$PENDING_FILE"
   DERIVED_MUTATED=0
   NGINX_ACTIVE_COLOR="$PENDING_ACTIVE_COLOR"
@@ -445,7 +639,19 @@ reconcile_pending_deployment() {
 
 cleanup_failed_deployment() {
   local status="$1"
+  local restore_failed=0
   if [[ "$CUTOVER_COMPLETE" == "0" ]]; then
+    if [[ -n "${GUIDELINE_CONFIG_VERSION:-}" ]]; then
+      if ! "${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py restore_guideline_publication \
+        --expected-version "$GUIDELINE_CONFIG_VERSION" \
+        --published-version "$GUIDELINE_PREVIOUS_PUBLISHED_VERSION" \
+        --cache-version "$GUIDELINE_PREVIOUS_CACHE_VERSION" \
+        --status "$GUIDELINE_PREVIOUS_STATUS" \
+        --strict; then
+        restore_failed=1
+        echo "Guideline publication recovery failed; preserving $PENDING_FILE for retry" >&2
+      fi
+    fi
     restore_nginx_config
     if [[ "$POINTER_CHANGED" == "1" && -n "$ACTIVE_PARQUET_SET" ]]; then
       rollback_link="$PARQUET_ROOT/.current-error-rollback"
@@ -453,8 +659,11 @@ cleanup_failed_deployment() {
       mv -Tf "$rollback_link" "$PARQUET_ROOT/current" || true
     fi
     "${COMPOSE[@]}" stop "$(frontend_for_color "$NEXT_COLOR")" "$(backend_for_color "$NEXT_COLOR")" >/dev/null 2>&1 || true
-    restore_derived_tables
-    if [[ -n "$NEW_PARQUET_PATH" && "$NEW_PARQUET_PATH" != "$ACTIVE_PARQUET_SET" \
+    if ! restore_derived_tables; then
+      restore_failed=1
+      echo "Derived-table recovery failed; preserving $PENDING_FILE for retry" >&2
+    fi
+    if [[ "$restore_failed" == "0" && -n "$NEW_PARQUET_PATH" && "$NEW_PARQUET_PATH" != "$ACTIVE_PARQUET_SET" \
       && ( "$NEW_PARQUET_PATH" == "$PARQUET_ROOT/.staging/"* || "$NEW_PARQUET_PATH" == "$PARQUET_ROOT/sets/"* ) ]]; then
       "${SUDO[@]}" rm -rf -- "$NEW_PARQUET_PATH" || true
     fi
@@ -469,17 +678,28 @@ cleanup_failed_deployment() {
       printf 'MIGRATION_CHANGES=true\nSCHEMA_GENERATION=%q\n' "$CANDIDATE_SCHEMA_GENERATION" >> "$STATE_DIR/current.env" || true
       rm -f "$STATE_DIR/current.env.bak" || true
     fi
+    if [[ "$restore_failed" == "0" ]]; then
+      if ! resume_guideline_updates; then
+        restore_failed=1
+        echo "Guideline updates remain paused; preserving $PENDING_FILE for retry" >&2
+      fi
+    fi
   fi
   "${SUDO[@]}" rm -rf "$NGINX_BACKUP_DIR" >/dev/null 2>&1 || true
-  rm -f "$PENDING_FILE"
+  if [[ "$restore_failed" == "0" ]]; then
+    rm -f "$PENDING_FILE"
+  fi
   echo "Deployment failed; active nginx and parquet pointers were preserved or restored" >&2
+  [[ "$restore_failed" == "0" ]]
 }
 
 on_exit() {
   local status=$?
   trap - EXIT INT TERM HUP
   if [[ "$status" != "0" ]]; then
-    cleanup_failed_deployment "$status"
+    if ! cleanup_failed_deployment "$status"; then
+      status=1
+    fi
   fi
   exit "$status"
 }
@@ -504,6 +724,11 @@ echo "Pulling immutable images for $IMAGE_TAG"
 "${COMPOSE[@]}" pull backend-tool "$(backend_for_color "$NEXT_COLOR")" "$(frontend_for_color "$NEXT_COLOR")"
 echo "Starting MariaDB and waiting for it to become healthy"
 "${COMPOSE[@]}" up -d --wait --wait-timeout "$HEALTH_TIMEOUT" mariadb
+
+if [[ "$PREPARE_DATA" == "true" || -n "$ROLLBACK_STATE" ]]; then
+  pause_guideline_updates
+  write_pending_state
+fi
 
 if [[ "$PREPARE_DATA" == "true" ]]; then
   active_set_bytes="$("${SUDO[@]}" du -sb "$ACTIVE_PARQUET_SET" 2>/dev/null | awk '{print $1}')"
@@ -538,6 +763,36 @@ MIGRATION_ATTEMPTED=1
 write_pending_state
 "${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py migrate --noinput
 
+if [[ -n "$ROLLBACK_STATE" ]]; then
+  publication_state="$("${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py guideline_publication_state)"
+  IFS='|' read -r GUIDELINE_CONFIG_VERSION GUIDELINE_PREVIOUS_PUBLISHED_VERSION \
+    GUIDELINE_PREVIOUS_CACHE_VERSION GUIDELINE_PREVIOUS_STATUS <<< "$publication_state"
+  export TOOL_PARQUET_SET_PATH="$CANDIDATE_PARQUET_SET"
+  target_publication_state="$("${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py guideline_publication_state --from-parquet)"
+  IFS='|' read -r _target_guideline_version GUIDELINE_TARGET_PUBLISHED_VERSION \
+    GUIDELINE_TARGET_CACHE_VERSION GUIDELINE_TARGET_STATUS <<< "$target_publication_state"
+  [[ "$GUIDELINE_TARGET_PUBLISHED_VERSION" =~ ^[0-9]+$ && -n "$GUIDELINE_TARGET_CACHE_VERSION" \
+    && "$GUIDELINE_TARGET_STATUS" == "complete" ]] || {
+    echo "Rollback parquet set has no valid guideline publication state" >&2
+    exit 1
+  }
+  [[ "$GUIDELINE_TARGET_PUBLISHED_VERSION" == "$GUIDELINE_CONFIG_VERSION" ]] || {
+    echo "Rollback is blocked because its guideline version differs from the current configuration" >&2
+    exit 1
+  }
+  copy_guideline_overlay_generation \
+    "$ACTIVE_PARQUET_SET" \
+    "$CANDIDATE_PARQUET_SET" \
+    "$GUIDELINE_PREVIOUS_CACHE_VERSION"
+  pause_candidate_guideline_updates
+  if [[ "${ROLLBACK_RESTORES_DERIVED:-0}" == "1" ]]; then
+    DERIVED_BACKUP="$APP_DIR/backups/derived-$timestamp.sql"
+    backup_derived_tables "$DERIVED_BACKUP"
+    DERIVED_MUTATED=1
+  fi
+  write_pending_state
+fi
+
 if [[ "$PREPARE_DATA" == "true" ]]; then
   [[ "$CANDIDATE_PARQUET_SET" == "$PARQUET_ROOT/.staging/"* ]] || {
     echo "Refusing to prepare data outside the parquet staging root" >&2
@@ -545,34 +800,23 @@ if [[ "$PREPARE_DATA" == "true" ]]; then
   }
   "${SUDO[@]}" rm -rf "$CANDIDATE_PARQUET_SET"
   mkdir -p "$CANDIDATE_PARQUET_SET"
+  pause_candidate_guideline_updates
   DERIVED_BACKUP="$APP_DIR/backups/derived-$timestamp.sql"
-  existing_derived="$("${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
-    mariadb -N -uroot -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$MARIADB_DATABASE' AND table_name IN ('GuidelineAdherenceFacts','GuidelineAdherence','VisitAttributes','SurgeryCaseAttributes')")"
-  if [[ "$existing_derived" == "4" ]]; then
-    DERIVED_ORIGINAL_STATE="four"
-    "${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
-      mariadb-dump -uroot --single-transaction "$MARIADB_DATABASE" \
-      GuidelineAdherenceFacts GuidelineAdherence VisitAttributes SurgeryCaseAttributes > "$DERIVED_BACKUP"
-    chmod 0600 "$DERIVED_BACKUP"
-  elif [[ "$existing_derived" == "3" ]]; then
-    DERIVED_ORIGINAL_STATE="three"
-    "${COMPOSE[@]}" exec -T -e MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb \
-      mariadb-dump -uroot --single-transaction "$MARIADB_DATABASE" \
-      GuidelineAdherence VisitAttributes SurgeryCaseAttributes > "$DERIVED_BACKUP"
-    chmod 0600 "$DERIVED_BACKUP"
-  elif [[ "$existing_derived" == "0" ]]; then
-    DERIVED_ORIGINAL_STATE="zero"
-  elif [[ "$existing_derived" != "0" ]]; then
-    echo "Expected zero, three, or four SQL-managed derived tables, found $existing_derived" >&2
-    false
-  fi
+  backup_derived_tables "$DERIVED_BACKUP"
   DERIVED_MUTATED=1
   NEW_PARQUET_PATH="$CANDIDATE_PARQUET_SET"
-  write_pending_state
   export TOOL_PARQUET_SET_PATH="$CANDIDATE_PARQUET_SET"
-  "${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py migrate_derived_tables
-  "${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py refresh_derived_tables
-  "${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py generate_parquets
+  GUIDELINE_CONFIG_VERSION="$("${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py guideline_config_version)"
+  publication_state="$("${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py guideline_publication_state)"
+  IFS='|' read -r _current_guideline_version GUIDELINE_PREVIOUS_PUBLISHED_VERSION \
+    GUIDELINE_PREVIOUS_CACHE_VERSION GUIDELINE_PREVIOUS_STATUS <<< "$publication_state"
+  write_pending_state
+  "${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py prepare_parquet_set \
+    --guideline-version "$GUIDELINE_CONFIG_VERSION"
+  copy_guideline_overlay_generation \
+    "$ACTIVE_PARQUET_SET" \
+    "$CANDIDATE_PARQUET_SET" \
+    "$GUIDELINE_PREVIOUS_CACHE_VERSION"
   "${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py validate_parquets \
     --image-tag "$IMAGE_TAG" --source-commit "$SOURCE_COMMIT" --write-manifest
   "${SUDO[@]}" chown -R "$(id -u):$(id -g)" "$CANDIDATE_PARQUET_SET"
@@ -592,11 +836,19 @@ until smoke_candidate_frontend "http://127.0.0.1:$NEXT_PORT" \
   sleep 3
 done
 
+if [[ "${ROLLBACK_RESTORES_DERIVED:-0}" == "1" ]]; then
+  restore_derived_snapshot \
+    "$ROLLBACK_DERIVED_ORIGINAL_STATE" \
+    "$ROLLBACK_DERIVED_BACKUP" \
+    "$ROLLBACK_DERIVED_TABLES"
+fi
+
 if [[ "$PREPARE_DATA" == "true" ]]; then
   promoted_set="$PARQUET_ROOT/sets/$PARQUET_SET_ID"
   mv "$CANDIDATE_PARQUET_SET" "$promoted_set"
   CANDIDATE_PARQUET_SET="$promoted_set"
   NEW_PARQUET_PATH="$promoted_set"
+  export TOOL_PARQUET_SET_PATH="$CANDIDATE_PARQUET_SET"
   write_pending_state
 fi
 
@@ -629,6 +881,43 @@ if ! curl -fsS --max-time 15 "$PUBLIC_BASE_URL/health/" >/dev/null \
   || ! smoke_auth "$PUBLIC_BASE_URL"; then
   false
 fi
+if [[ "$PREPARE_DATA" == "true" ]]; then
+  "${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py commit_guideline_overlay \
+    --guideline-version "$GUIDELINE_CONFIG_VERSION"
+elif [[ -n "$ROLLBACK_STATE" ]]; then
+  "${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py restore_guideline_publication \
+    --expected-version "$GUIDELINE_CONFIG_VERSION" \
+    --published-version "$GUIDELINE_TARGET_PUBLISHED_VERSION" \
+    --cache-version "$GUIDELINE_TARGET_CACHE_VERSION" \
+    --status "$GUIDELINE_TARGET_STATUS" \
+    --strict
+fi
+publication_state="$("${COMPOSE[@]}" run --rm backend-tool poetry run python manage.py guideline_publication_state)"
+IFS='|' read -r GUIDELINE_CONFIG_VERSION GUIDELINE_PUBLISHED_VERSION \
+  GUIDELINE_CACHE_VERSION GUIDELINE_STATUS <<< "$publication_state"
+[[ "$GUIDELINE_PUBLISHED_VERSION" =~ ^[0-9]+$ \
+  && "$GUIDELINE_CACHE_VERSION" != "" \
+  && "$GUIDELINE_STATUS" == "complete" ]] || {
+  echo "Guideline publication did not commit successfully" >&2
+  false
+}
+if [[ "$PREPARE_DATA" == "true" ]]; then
+  [[ "$GUIDELINE_PUBLISHED_VERSION" == "$GUIDELINE_CONFIG_VERSION" ]] || {
+    echo "Guideline publication version does not match the prepared configuration" >&2
+    false
+  }
+elif [[ -n "$ROLLBACK_STATE" ]]; then
+  [[ "$GUIDELINE_PUBLISHED_VERSION" == "$GUIDELINE_TARGET_PUBLISHED_VERSION" \
+    && "$GUIDELINE_CACHE_VERSION" == "$GUIDELINE_TARGET_CACHE_VERSION" ]] || {
+    echo "Guideline publication does not match the rollback target" >&2
+    false
+  }
+fi
+copy_guideline_overlay_generation \
+  "$CANDIDATE_PARQUET_SET" \
+  "$CANDIDATE_PARQUET_SET" \
+  "$GUIDELINE_CACHE_VERSION"
+resume_guideline_updates
 deployment_id="$timestamp-$IMAGE_TAG"
 state_file="$STATE_DIR/history/$deployment_id.env"
 {
@@ -646,6 +935,13 @@ state_file="$STATE_DIR/history/$deployment_id.env"
   printf 'MIGRATION_CHANGES=%q\n' "$MIGRATION_CHANGES"
   printf 'SCHEMA_GENERATION=%q\n' "$CANDIDATE_SCHEMA_GENERATION"
   printf 'DEPLOY_PACKAGE_COMMIT=%q\n' "$DEPLOY_PACKAGE_COMMIT"
+  printf 'GUIDELINE_CONFIG_VERSION=%q\n' "$GUIDELINE_CONFIG_VERSION"
+  printf 'GUIDELINE_PUBLISHED_VERSION=%q\n' "$GUIDELINE_PUBLISHED_VERSION"
+  printf 'GUIDELINE_CACHE_VERSION=%q\n' "$GUIDELINE_CACHE_VERSION"
+  printf 'GUIDELINE_STATUS=%q\n' "$GUIDELINE_STATUS"
+  printf 'DERIVED_ROLLBACK_BACKUP=%q\n' "$DERIVED_BACKUP"
+  printf 'DERIVED_ROLLBACK_ORIGINAL_STATE=%q\n' "$DERIVED_ORIGINAL_STATE"
+  printf 'DERIVED_ROLLBACK_TABLES=%q\n' "$DERIVED_ORIGINAL_TABLES"
   printf 'DEPLOYED_AT=%q\n' "$timestamp"
   printf 'DEPLOYMENT_ID=%q\n' "$deployment_id"
 } > "$state_file"
@@ -659,7 +955,20 @@ NEW_PARQUET_PATH=""
 "${SUDO[@]}" rm -rf "$NGINX_BACKUP_DIR" || true
 mapfile -t successful_history < <(ls -1t "$STATE_DIR/history"/20*.env 2>/dev/null || true)
 for ((history_index = ROLLBACK_RETENTION_COUNT; history_index < ${#successful_history[@]}; history_index += 1)); do
-  rm -f -- "${successful_history[$history_index]}"
+  stale_state="${successful_history[$history_index]}"
+  stale_derived_backup="$(
+    unset DERIVED_ROLLBACK_BACKUP
+    # shellcheck disable=SC1090
+    source "$stale_state"
+    printf '%s' "${DERIVED_ROLLBACK_BACKUP:-}"
+  )"
+  rm -f -- "$stale_state"
+  if [[ "$stale_derived_backup" == "$APP_DIR/backups/derived-"*.sql \
+    && -f "$stale_derived_backup" ]] \
+    && ! rg -F -q -- "$stale_derived_backup" "$STATE_DIR/current.env" "$STATE_DIR/history" 2>/dev/null \
+    && ! grep -F -R -q -- "$stale_derived_backup" "$STATE_DIR/current.env" "$STATE_DIR/history" 2>/dev/null; then
+    rm -f -- "$stale_derived_backup"
+  fi
 done
 for stale_staging in "$PARQUET_ROOT/.staging/"*; do
   [[ -e "$stale_staging" ]] || continue

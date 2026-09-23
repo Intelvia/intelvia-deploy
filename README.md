@@ -16,6 +16,8 @@ docker compose pull
 docker compose up -d
 ```
 
+Backend restarts apply Django migrations but do not recreate populated derived tables. On a first installation, run the data preparation and validation commands below before using the application.
+
 `INTELVIA_IMAGE_TAG` must remain an explicit semantic version. Intelvia does not publish or support `latest`, `edge`, or other mutable deployment tags.
 
 MariaDB uses the `intelvia_mariadb_data` volume because the Compose project name is fixed to `intelvia`. The parquet cache remains a separate `./backend/parquet_cache` bind mount.
@@ -23,13 +25,13 @@ MariaDB uses the `intelvia_mariadb_data` volume because the Compose project name
 After a source-data refresh, explicitly rebuild derived data and parquets:
 
 ```bash
-docker compose run --rm backend poetry run python manage.py migrate_derived_tables
-docker compose run --rm backend poetry run python manage.py refresh_derived_tables
-docker compose run --rm backend poetry run python manage.py generate_parquets
+docker compose run --rm backend poetry run python manage.py prepare_parquet_set --commit
 docker compose run --rm backend poetry run python manage.py validate_parquets \
   --image-tag "$INTELVIA_IMAGE_TAG" --source-commit operator-managed --write-manifest
 docker compose restart backend frontend
 ```
+
+`prepare_parquet_set --commit` is synchronous and does not require a Celery worker or Redis.
 
 Before upgrading, read the release notes for migration or data-refresh requirements. Never run `docker compose down -v`, `docker volume prune`, or another volume-deleting command against a production deployment.
 
@@ -66,7 +68,7 @@ Data-impacting commits are detected with `detect-data-impact.sh` and `data-impac
 - `force`: always refresh derived tables and stage a new parquet set.
 - `reuse`: explicitly reuse the current set; manual operator override only.
 
-New files are generated under `parquets/.staging/<image-tag>-<timestamp>` in the deployment checkout, validated, and promoted to the matching path under `parquets/sets/` only during a healthy cutover. The timestamp preserves rollback identity when an operator force-regenerates data for the same image. Each set includes `manifest.json` with its producer, checksums, sizes, row counts, and Arrow schemas. The deploy refuses data preparation unless it can retain the active set plus `MIN_PARQUET_FREE_BYTES` of headroom.
+New files are generated under `parquets/.staging/<image-tag>-<timestamp>` in the deployment checkout, validated, and promoted to the matching path under `parquets/sets/` only during a healthy cutover. The timestamp preserves rollback identity when an operator force-regenerates data for the same image. Each validated set includes `validation_manifest.json` with its producer, checksums, sizes, row counts, and Arrow schemas; a later regeneration removes this report until validation runs again. `manifest.json` tracks active artifact versions. The deploy refuses data preparation unless it can retain the active set plus `MIN_PARQUET_FREE_BYTES` of headroom.
 
 The scheduled `Refresh intelvia.app production data` workflow runs daily at 02:00 UTC. It reuses the active image digests and exact deploy-package commit, then performs the same staged blue-green cutover in `force` mode. This replaces direct Celery writes into the active immutable parquet set.
 
@@ -84,7 +86,7 @@ Restore a recorded application/parquet pair with:
 bash rollback.sh <deployment-id>
 ```
 
-Rollback does not reverse Django migrations. Deployment state increments a schema generation whenever migration files change and refuses rollback to a state from another generation. A new forward deployment is required across that boundary.
+Rollback does not reverse Django migrations. Deployment state increments a schema generation whenever migration files change and refuses rollback to a state from another generation. A new forward deployment is required across that boundary. Application-only rollback can use any retained state in the current schema generation. A rollback that changes parquet data is limited to the immediately previous parquet generation because that is the generation whose matching SQL-derived tables are snapshotted and verified during restore.
 
 The newest `ROLLBACK_RETENTION_COUNT` successful states are retained, defaulting to five; older state files and their unreferenced parquet sets are removed together. Unused images older than seven days are pruned after a successful deployment. A rollback whose local image was pruned pulls its recorded digest again from Docker Hub.
 
@@ -92,4 +94,4 @@ Before mutation, `deploy.sh` writes `.deploy-state/pending.env`. Signals run the
 
 The public health endpoint validates MariaDB, global parquet schemas, and a write/delete probe in `/app/parquet_cache/user_artifacts`. Deployment also checks the authentication mode configured in the VM-local `.env`: `DJANGO_DISABLE_LOGINS=True` must return the login-disabled access payload, while `False` must reach CAS through the redirect chain. Representative department/provider access should still be exercised through the institution's non-PHI smoke accounts when CAS is enabled.
 
-Data-preparing releases retain pre-deployment database backups as daily, weekly, and monthly snapshots under `backups/`. Ordinary application-only releases skip this expensive dump along with derived refresh and parquet generation. These local snapshots do not replace encrypted off-VM backups and periodic restore testing.
+Data-preparing releases retain pre-deployment database backups as daily, weekly, and monthly snapshots under `backups/`. They also retain the smaller derived-table snapshot needed for an immediate data rollback; it is removed when no retained deployment state references it. Ordinary application-only releases skip the expensive full dump along with derived refresh and parquet generation. These local snapshots do not replace encrypted off-VM backups and periodic restore testing.
