@@ -1,3 +1,9 @@
 [mariadb]
 plugin_load_add = server_audit
-server_audit=FORCE_PLUS_PERMANENT
+server_audit = FORCE_PLUS_PERMANENT
+server_audit_logging = ON
+server_audit_events = CONNECT,QUERY_DDL,QUERY_DCL,TABLE
+server_audit_output_type = FILE
+server_audit_file_path = /var/lib/mysql/server_audit.log
+server_audit_file_rotate_size = 52428800
+server_audit_file_rotations = 20

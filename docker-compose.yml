@@ -1,26 +1,217 @@
 name: ${COMPOSE_PROJECT_NAME:-intelvia}
 
+x-backend-common: &backend-common
+  image: docker.io/intelvia/intelvia-backend:${INTELVIA_IMAGE_TAG:?INTELVIA_IMAGE_TAG is required}
+  env_file:
+    - .env
+  environment:
+    MARIADB_HOST: mariadb
+    MARIADB_PORT: "3306"
+    MARIADB_TLS_CA: /run/secrets/mariadb-ca.pem
+  volumes:
+    - ./backend/parquet_cache:/app/parquet_cache:z
+    - ${MARIADB_TLS_CA_HOST_FILE:?MARIADB_TLS_CA_HOST_FILE is required}:/run/secrets/mariadb-ca.pem:ro
+
 services:
-  backend:
-    image: docker.io/intelvia/intelvia-backend:${INTELVIA_IMAGE_TAG:?INTELVIA_IMAGE_TAG is required}
+  mariadb:
+    image: docker.io/mariadb:11.8.8
     restart: unless-stopped
-    env_file:
-      - .env
+    entrypoint:
+      - /usr/local/bin/intelvia-mariadb-secure-entrypoint
+    command:
+      - mariadbd
     environment:
-      PARQUET_CACHE_DIR: /app/parquet_cache
-      RUN_STARTUP_MIGRATIONS: "true"
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${MARIADB_DATABASE}
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - mariadb_socket:/run/mysqld
+      - ./mariadb/conf.d:/etc/mysql/conf.d:ro,z
+      - ./mariadb/scripts/secure-entrypoint.sh:/usr/local/bin/intelvia-mariadb-secure-entrypoint:ro
+      - ${MARIADB_ENCRYPTION_KEY_HOST_FILE:?MARIADB_ENCRYPTION_KEY_HOST_FILE is required}:/run/intelvia-source-secrets/encryption-keys.enc:ro
+      - ${MARIADB_ENCRYPTION_KEY_PASSWORD_HOST_FILE:?MARIADB_ENCRYPTION_KEY_PASSWORD_HOST_FILE is required}:/run/intelvia-source-secrets/encryption-key-password:ro
+      - ${MARIADB_TLS_CA_HOST_FILE:?MARIADB_TLS_CA_HOST_FILE is required}:/run/intelvia-source-secrets/ca.pem:ro
+      - ${MARIADB_TLS_SERVER_CERT_HOST_FILE:?MARIADB_TLS_SERVER_CERT_HOST_FILE is required}:/run/intelvia-source-secrets/server-cert.pem:ro
+      - ${MARIADB_TLS_SERVER_KEY_HOST_FILE:?MARIADB_TLS_SERVER_KEY_HOST_FILE is required}:/run/intelvia-source-secrets/server-key.pem:ro
+    tmpfs:
+      - /run/intelvia-mariadb-secrets:rw,noexec,nosuid,nodev,size=1m
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -uroot --password=\"$${MARIADB_ROOT_PASSWORD}\" -e 'SELECT 1' >/dev/null 2>&1"]
+      start_period: 5s
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  mariadb-provision:
+    image: docker.io/mariadb:11.8.8
+    restart: "no"
+    entrypoint:
+      - /bin/bash
+      - /usr/local/bin/configure-intelvia-users
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${MARIADB_DATABASE}
+      MARIADB_APP_USER: ${MARIADB_APP_USER}
+      MARIADB_APP_PASSWORD: ${MARIADB_APP_PASSWORD}
+      MARIADB_MIGRATION_USER: ${MARIADB_MIGRATION_USER}
+      MARIADB_MIGRATION_PASSWORD: ${MARIADB_MIGRATION_PASSWORD}
+      MARIADB_REFRESH_USER: ${MARIADB_REFRESH_USER}
+      MARIADB_REFRESH_PASSWORD: ${MARIADB_REFRESH_PASSWORD}
+      MARIADB_LEGACY_USER: ${MARIADB_LEGACY_USER:-intelvia}
+      MARIADB_RETIRE_LEGACY_USER: "false"
+      MARIADB_CREATE_TEST_DATABASE: ${MARIADB_CREATE_TEST_DATABASE:-false}
     depends_on:
       mariadb:
         condition: service_healthy
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - mariadb_socket:/run/mysqld
+      - ./mariadb/scripts/configure-users.sh:/usr/local/bin/configure-intelvia-users:ro
+
+  mariadb-security-check:
+    image: docker.io/mariadb:11.8.8
+    restart: "no"
+    entrypoint:
+      - /bin/bash
+      - /usr/local/bin/verify-intelvia-mariadb-security
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${MARIADB_DATABASE}
+      MARIADB_ENCRYPTION_MIGRATION_TIMEOUT: ${MARIADB_ENCRYPTION_MIGRATION_TIMEOUT:-21600}
+    depends_on:
+      mariadb-provision:
+        condition: service_completed_successfully
+    volumes:
+      - mariadb_data:/var/lib/mysql:ro
+      - mariadb_socket:/run/mysqld
+      - ./mariadb/scripts/verify-security.sh:/usr/local/bin/verify-intelvia-mariadb-security:ro
+
+  backend-migrate:
+    <<: *backend-common
+    restart: "no"
+    environment:
+      MARIADB_HOST: mariadb
+      MARIADB_PORT: "3306"
+      MARIADB_USER: ${MARIADB_MIGRATION_USER}
+      MARIADB_PASSWORD: ${MARIADB_MIGRATION_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ""
+      MARIADB_APP_PASSWORD: ""
+      MARIADB_MIGRATION_PASSWORD: ""
+      MARIADB_REFRESH_PASSWORD: ""
+      MARIADB_TLS_CA: /run/secrets/mariadb-ca.pem
+      MARIADB_ALLOW_LOCAL_INFILE: "false"
+    command:
+      - /bin/bash
+      - -c
+      - >-
+        poetry run python manage.py migrate --noinput
+        && poetry run python manage.py guideline_config_version
+    depends_on:
+      mariadb-security-check:
+        condition: service_completed_successfully
+
+  mariadb-finalize-grants:
+    image: docker.io/mariadb:11.8.8
+    restart: "no"
+    entrypoint:
+      - /bin/bash
+      - /usr/local/bin/configure-intelvia-users
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${MARIADB_DATABASE}
+      MARIADB_APP_USER: ${MARIADB_APP_USER}
+      MARIADB_APP_PASSWORD: ${MARIADB_APP_PASSWORD}
+      MARIADB_MIGRATION_USER: ${MARIADB_MIGRATION_USER}
+      MARIADB_MIGRATION_PASSWORD: ${MARIADB_MIGRATION_PASSWORD}
+      MARIADB_REFRESH_USER: ${MARIADB_REFRESH_USER}
+      MARIADB_REFRESH_PASSWORD: ${MARIADB_REFRESH_PASSWORD}
+      MARIADB_LEGACY_USER: ${MARIADB_LEGACY_USER:-intelvia}
+      MARIADB_RETIRE_LEGACY_USER: "false"
+      MARIADB_CREATE_TEST_DATABASE: ${MARIADB_CREATE_TEST_DATABASE:-false}
+    depends_on:
+      backend-migrate:
+        condition: service_completed_successfully
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - mariadb_socket:/run/mysqld
+      - ./mariadb/scripts/configure-users.sh:/usr/local/bin/configure-intelvia-users:ro
+
+  backend:
+    <<: *backend-common
+    restart: unless-stopped
+    environment:
+      MARIADB_HOST: mariadb
+      MARIADB_PORT: "3306"
+      MARIADB_USER: ${MARIADB_APP_USER}
+      MARIADB_PASSWORD: ${MARIADB_APP_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ""
+      MARIADB_APP_PASSWORD: ""
+      MARIADB_MIGRATION_PASSWORD: ""
+      MARIADB_REFRESH_PASSWORD: ""
+      MARIADB_TLS_CA: /run/secrets/mariadb-ca.pem
+      MARIADB_ALLOW_LOCAL_INFILE: "false"
+      PARQUET_CACHE_DIR: /app/parquet_cache
+      RUN_STARTUP_MIGRATIONS: "false"
+    depends_on:
+      mariadb-finalize-grants:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
-    volumes:
-      - ./backend/parquet_cache:/app/parquet_cache:z
+
+  backend-tool:
+    <<: *backend-common
+    restart: "no"
+    profiles:
+      - tools
+    environment:
+      MARIADB_HOST: mariadb
+      MARIADB_PORT: "3306"
+      MARIADB_USER: ${MARIADB_MIGRATION_USER}
+      MARIADB_PASSWORD: ${MARIADB_MIGRATION_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ""
+      MARIADB_APP_PASSWORD: ""
+      MARIADB_MIGRATION_PASSWORD: ""
+      MARIADB_REFRESH_PASSWORD: ""
+      MARIADB_TLS_CA: /run/secrets/mariadb-ca.pem
+      MARIADB_ALLOW_LOCAL_INFILE: ${MARIADB_TOOL_ALLOW_LOCAL_INFILE:-false}
+    depends_on:
+      mariadb-provision:
+        condition: service_completed_successfully
+
+  backend-refresh-tool:
+    <<: *backend-common
+    restart: "no"
+    profiles:
+      - tools
+    environment:
+      MARIADB_HOST: mariadb
+      MARIADB_PORT: "3306"
+      MARIADB_USER: ${MARIADB_REFRESH_USER}
+      MARIADB_PASSWORD: ${MARIADB_REFRESH_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ""
+      MARIADB_APP_PASSWORD: ""
+      MARIADB_MIGRATION_PASSWORD: ""
+      MARIADB_REFRESH_PASSWORD: ""
+      MARIADB_TLS_CA: /run/secrets/mariadb-ca.pem
+      MARIADB_ALLOW_LOCAL_INFILE: "false"
+    depends_on:
+      mariadb-security-check:
+        condition: service_completed_successfully
 
   celery-worker:
-    image: docker.io/intelvia/intelvia-backend:${INTELVIA_IMAGE_TAG:?INTELVIA_IMAGE_TAG is required}
-    env_file:
-      - .env
+    <<: *backend-common
+    restart: unless-stopped
+    environment:
+      MARIADB_HOST: mariadb
+      MARIADB_PORT: "3306"
+      MARIADB_USER: ${MARIADB_REFRESH_USER}
+      MARIADB_PASSWORD: ${MARIADB_REFRESH_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ""
+      MARIADB_APP_PASSWORD: ""
+      MARIADB_MIGRATION_PASSWORD: ""
+      MARIADB_REFRESH_PASSWORD: ""
+      MARIADB_TLS_CA: /run/secrets/mariadb-ca.pem
+      MARIADB_ALLOW_LOCAL_INFILE: "false"
     entrypoint: []
     command: >
       poetry run celery -A api worker
@@ -28,42 +219,32 @@ services:
       --concurrency=${CELERY_WORKER_CONCURRENCY:-1}
       --prefetch-multiplier=${CELERY_WORKER_PREFETCH_MULTIPLIER:-1}
     depends_on:
-      mariadb:
-        condition: service_healthy
+      mariadb-finalize-grants:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
-    volumes:
-      - ./backend/parquet_cache:/app/parquet_cache:z
 
   celery-beat:
-    image: docker.io/intelvia/intelvia-backend:${INTELVIA_IMAGE_TAG:?INTELVIA_IMAGE_TAG is required}
-    env_file:
-      - .env
+    <<: *backend-common
+    restart: unless-stopped
+    environment:
+      MARIADB_HOST: mariadb
+      MARIADB_PORT: "3306"
+      MARIADB_USER: ${MARIADB_APP_USER}
+      MARIADB_PASSWORD: ${MARIADB_APP_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ""
+      MARIADB_APP_PASSWORD: ""
+      MARIADB_MIGRATION_PASSWORD: ""
+      MARIADB_REFRESH_PASSWORD: ""
+      MARIADB_TLS_CA: /run/secrets/mariadb-ca.pem
+      MARIADB_ALLOW_LOCAL_INFILE: "false"
     entrypoint: []
     command: poetry run celery -A api beat --loglevel=${CELERY_BEAT_LOG_LEVEL:-info}
     depends_on:
-      mariadb:
-        condition: service_healthy
+      mariadb-finalize-grants:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
-
-  mariadb:
-    image: docker.io/mariadb:11
-    restart: unless-stopped
-    environment:
-      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
-      MARIADB_DATABASE: ${MARIADB_DATABASE}
-      MARIADB_USER: ${MARIADB_USER}
-      MARIADB_PASSWORD: ${MARIADB_PASSWORD}
-    volumes:
-      - mariadb_data:/var/lib/mysql
-      - ./mariadb/conf.d:/etc/mysql/conf.d:ro,z
-    healthcheck:
-      test: ["CMD-SHELL", "mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -uroot --password=\"$${MARIADB_ROOT_PASSWORD}\" -e 'SELECT 1' >/dev/null 2>&1"]
-      start_period: 3s
-      interval: 10s
-      timeout: 5s
-      retries: 12
 
   redis:
     image: redis:7-alpine
@@ -81,10 +262,11 @@ services:
     environment:
       BACKEND_UPSTREAM: backend
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     depends_on:
       - backend
 
 volumes:
   mariadb_data:
+  mariadb_socket:
   redis_data:

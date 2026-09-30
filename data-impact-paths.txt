@@ -3,10 +3,13 @@ backend/api/migrations/**
 backend/api/models/**
 backend/api/models_derived/**
 backend/api/management/commands/generate_parquets.py
+backend/api/management/commands/prepare_parquet_set.py
 backend/api/management/commands/migrate_derived_tables.py
 backend/api/management/commands/refresh_derived_tables.py
 backend/api/management/commands/validate_parquets.py
 backend/api/artifacts.py
+backend/api/artifact_encryption.py
+backend/api/guideline_overlays.py
 backend/api/parquet_contract.py
 backend/api/parquet_schemas.py
 backend/api/tasks.py
