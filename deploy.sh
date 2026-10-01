@@ -349,7 +349,6 @@ ACTIVE_BACKEND_IMAGE=""
 ACTIVE_FRONTEND_IMAGE=""
 SCHEMA_GENERATION=0
 SECURITY_GENERATION=0
-GUIDELINE_CONFIG_VERSION=""
 GUIDELINE_PREVIOUS_PUBLISHED_VERSION=""
 GUIDELINE_PREVIOUS_CACHE_VERSION=""
 GUIDELINE_PREVIOUS_STATUS=""
@@ -396,7 +395,7 @@ if [[ "$RECOVER_ONLY" == "1" ]]; then
   else
     IMAGE_TAG="$ACTIVE_IMAGE_TAG"
     SOURCE_COMMIT="$ACTIVE_SOURCE_COMMIT"
-    BACKEND_IMAGE="$ACTIVE_BACKEND_IMAGE"
+    BACKEND_IMAGE="${PENDING_BACKEND_IMAGE:-$ACTIVE_BACKEND_IMAGE}"
     FRONTEND_IMAGE="$ACTIVE_FRONTEND_IMAGE"
   fi
   DATA_PREPARATION_MODE="reuse"
@@ -771,7 +770,7 @@ copy_guideline_overlay_generation() {
     || ! -f "$source_dir/guideline_adherence_overlay.v${cache_version}.json" ]]; then
     source_dir="$source_set"
   fi
-  mkdir -p "$target_dir"
+  "${SUDO[@]}" mkdir -p "$target_dir"
   for file_name in \
     "guideline_adherence_overlay.v${cache_version}.parquet" \
     "guideline_adherence_overlay.v${cache_version}.json"; do
@@ -780,13 +779,13 @@ copy_guideline_overlay_generation() {
       return 1
     }
     if [[ "$source_dir" != "$target_dir" ]]; then
-      cp -p "$source_dir/$file_name" "$target_dir/$file_name"
+      "${SUDO[@]}" cp -p "$source_dir/$file_name" "$target_dir/$file_name"
     fi
   done
   if [[ "$source_set" == "$target_set" ]]; then
-    cp -p "$target_dir/guideline_adherence_overlay.v${cache_version}.json" \
+    "${SUDO[@]}" cp -p "$target_dir/guideline_adherence_overlay.v${cache_version}.json" \
       "$target_dir/guideline_adherence_overlay.json.tmp"
-    mv -f "$target_dir/guideline_adherence_overlay.json.tmp" \
+    "${SUDO[@]}" mv -f "$target_dir/guideline_adherence_overlay.json.tmp" \
       "$target_dir/guideline_adherence_overlay.json"
   fi
 }
@@ -1101,6 +1100,7 @@ on_exit() {
   exit "$status"
 }
 
+GUIDELINE_CONFIG_VERSION=""
 trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
