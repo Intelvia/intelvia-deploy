@@ -2,6 +2,8 @@
 backend/api/migrations/**
 backend/api/models/**
 backend/api/models_derived/**
+backend/api/medications.json
+backend/api/medications.py
 backend/api/management/commands/generate_parquets.py
 backend/api/management/commands/prepare_parquet_set.py
 backend/api/management/commands/migrate_derived_tables.py
