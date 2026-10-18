@@ -94,6 +94,9 @@ app_writable_tables=(
   api_stateaccess
   DataExclusion
   IntelviaUserAccess
+  IntelviaAccessPolicy
+  IntelviaAccessHistory
+  IntelviaInvitation
   IntelviaDepartmentAccess
   IntelviaSettings
   ProviderDepartmentMapping

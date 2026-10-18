@@ -54,6 +54,28 @@ docker compose restart backend frontend
 
 Before upgrading, read the release notes for migration or data-refresh requirements. Never run `docker compose down -v`, `docker volume prune`, or another volume-deleting command against a production deployment.
 
+## First PBM Champion and recovery
+
+Before admitting users, provision the exact institutional SSO username and contact email:
+
+```bash
+docker compose --profile tools run --rm backend-tool poetry run python manage.py setup_champion ExactInstitutionalID --email champion@example.org
+```
+
+The command is independent of clinical data. It creates an account with an unusable local password and assigns the PBM Champion role without granting Django staff/superuser privileges. Existing champions and their departments are preserved on repeat execution. Existing non-champion roles require `--change-role`; inactive accounts require `--reactivate`. An omitted email reuses an existing valid contact email.
+
+Restore a missing champion profile by repeating the command. Replace a champion atomically with:
+
+```bash
+docker compose --profile tools run --rm backend-tool poetry run python manage.py setup_champion IncomingInstitutionalID --email incoming@example.org --replace OutgoingInstitutionalID
+```
+
+Replacement revokes the outgoing account's Intelvia access, retains its Django account, and preserves other champions. Supply the same explicit conflict/reactivation options when required. These commands do not require frontend access or clinical artifacts.
+
+Verify the institution's actual SSO integration returns this exact username (currently CAS uses `unid`). Complete a real SSO login and confirm `/api/whoami` and `/api/me` identify the expected champion and capabilities. LDAP may back institutional identity but does not itself supply an SSO integration. No Django staff/superuser privileges are needed for application Settings.
+
+Separately validate imported departments and provider mappings, then refresh derived tables before generating and validating artifacts. Until clinical data is available, the existing data-retrieval failure screen remains expected; eligible champions can dismiss it to open Administration. Authenticated users without an access profile receive a pending profile and see “Awaiting approval,” their username, champion contacts, access-request controls, Check approval status, and Sign out. A valid invitation can supply advance approval. Pending accounts receive no clinical access. Automated tests cannot establish that the live institutional SSO integration works.
+
 ## intelvia.app continuous deployment
 
 Intelvia's own VM uses `docker-compose.intelvia-app.yml`, `deploy.sh`, and host nginx. Every validated `main` commit publishes and deploys matching frontend/backend images named `sha-<full-commit>`.
@@ -130,3 +152,19 @@ Every `/api/` response includes a server-generated `X-Request-ID`, and Django em
 
 Data-preparing releases retain AES-256 encrypted, HMAC-authenticated pre-deployment database backups in daily, weekly, and monthly `predeploy-<period>-<timestamp>/` directories under `backups/`. Each directory contains `backup.sql.enc` and its `.hmac` sidecar and becomes visible only after both files are complete and verified. They use PBKDF2 with the MariaDB encryption password file and never write the SQL dump to disk in plaintext. At startup, deployment atomically encrypts, integrity-checks, and adopts any interrupted or legacy `.sql` or `.sql.tmp` snapshots before removing the plaintext copy. Ordinary application-only releases skip the expensive new dump along with derived refresh and parquet generation. These local snapshots do not replace encrypted off-VM backups and periodic restore testing.
 The derived-table snapshot used for immediate data rollback is also encrypted and authenticated. It is removed when no retained deployment state references it.
+
+### Account-approval rollout and recovery
+
+Apply the account-approval migration before starting the upgraded application. Existing explicit role and department assignments remain approved; accounts without an access profile start pending. Existing provider accounts are linked to the matching imported clinical provider ID. Missing configuration still blocks effective access. Confirm that at least one active PBM Champion has a valid contact email; rerun `setup_champion ExactInstitutionalID --email champion@example.org` if needed.
+
+After account approval is enabled, provisioning and replacement use the same account lock, approval metadata, access version, and access history as Administration. Replacement revokes the outgoing profile and retains its account, provider linkage, and history. Restoring rejected or revoked access requires an explicit `--restore` in addition to any necessary `--reactivate` or `--change-role` flags:
+
+```sh
+docker compose --profile tools run --rm backend-tool poetry run python manage.py setup_champion ExactInstitutionalID --email champion@example.org --restore
+```
+
+PBM Champions can open Administration even when clinical artifacts are unavailable. Invitations are copied from the platform and shared manually; email delivery is outside this release. Missing clinical provider department mappings must be repaired through the existing operator import/refresh workflow, then the user can retry. Administration does not modify clinical attribution.
+
+Invitations retain their approval intent at issuance; fixing a missing mapping does not upgrade an incomplete invitation into advance approval. Invitations predating the approval-intent migration remain pending on claim; reissue them to supply advance approval. A valid SSO `email` attribute fills an empty account contact address, while existing contact corrections remain unchanged. Institutions using another attribute name can map it to `email` through `CAS_RENAME_ATTRIBUTES`.
+
+Check a fresh institutional login, a pending signup, a matching invitation claim, and approval/revocation in an already-open session in the hospital's actual SSO environment. Local fixture logins do not validate institutional CAS attributes or identity formatting.
